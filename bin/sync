@@ -39,7 +39,6 @@ agents.each do |agent|
   abort "Error: Invalid source for #{agent["name"]}: #{agent["source"]}" unless safe_path?(agent["source"])
   abort "Error: Invalid target for #{agent["name"]}: #{agent["target"]}" unless safe_path?(agent["target"])
 end
-
 hosts = if ENV["HOSTS"]
   ENV["HOSTS"].split(",").map(&:strip)
 else
@@ -82,26 +81,56 @@ agents.each do |agent|
   remote_dir = "#{remote_path}/#{agent["target"]}"
   remote_spec = "#{ssh_user}@#{host}:#{remote_dir}/"
 
-  # Dry-run rsync in both directions to detect real differences
+  # Dry-run rsync in both directions to figure out which side has actual content changes.
+  #
+  # We use --checksum so rsync compares files by content hash instead of modification time.
+  # Without it, rsync defaults to comparing mtimes, and since local and remote machines almost
+  # always have different timestamps for the same files (e.g. after a fresh clone or copy),
+  # every file would show up as "changed" even when the content is identical.
+  #
+  # We also use -rlz instead of -a (archive mode). The -a flag includes -rlptgoD, which
+  # preserves permissions, owner, and group. Since local (macOS) and remote (Linux) have
+  # different users/UIDs, those metadata differences would also trigger false positives.
+  # We only need: -r (recursive), -l (symlinks), -z (compress during transfer).
+  #
+  # --itemize-changes makes rsync output one line per file describing what differs.
+  # Each line looks like: "<f.sT....." where each character position means something:
+  #   Position 0: < (sent), > (received), c (created), . (not transferred)
+  #   Position 1: f (file), d (directory)
+  #   Position 2: c (checksum differs), . (same)
+  #   Position 3: s (size differs), . (same)
+  #   Position 4: T (timestamp differs), . (same)
+  #   ...etc for permissions, owner, group
+  #
+  # Even with --checksum, rsync still reports timestamp-only differences in the output.
+  # A line like ".f..T....." means "file exists on both sides, content is identical,
+  # only the timestamp differs" — not a real change. We filter these out so only
+  # lines with actual content/size/deletion differences are counted.
   local_changes = []
   remote_changes = []
   local_mtime = nil
   remote_mtime = nil
 
+  # Filter that ignores timestamp-only differences (no actual content change).
+  # Matches lines like ".f..T....." or ".d..T....." where only the T flag is set.
+  timestamp_only = /\A\.[fd]\.\.T\.+\s/
+
   run_locally do
+    # Check what local -> remote would transfer (i.e. what local has that remote doesn't)
     if Dir.exist?(local_dir)
-      out = capture(:rsync, "-az", "--delete", "--dry-run", "--itemize-changes",
+      out = capture(:rsync, "-rlz", "--checksum", "--delete", "--dry-run", "--itemize-changes",
         "#{local_dir}/", remote_spec, raise_on_non_zero_exit: false)
-      local_changes = out.lines.map(&:strip).reject(&:empty?)
+      local_changes = out.lines.map(&:strip).reject { |l| l.empty? || l.match?(timestamp_only) }
 
       # Find latest local mtime
       local_files = Dir.glob("#{local_dir}/**/*").select { |f| File.file?(f) }
       local_mtime = local_files.map { |f| File.mtime(f) }.max
     end
 
-    out = capture(:rsync, "-az", "--delete", "--dry-run", "--itemize-changes",
+    # Check what remote -> local would transfer (i.e. what remote has that local doesn't)
+    out = capture(:rsync, "-rlz", "--checksum", "--delete", "--dry-run", "--itemize-changes",
       remote_spec, "#{local_dir}/", raise_on_non_zero_exit: false)
-    remote_changes = out.lines.map(&:strip).reject(&:empty?)
+    remote_changes = out.lines.map(&:strip).reject { |l| l.empty? || l.match?(timestamp_only) }
   end
 
   # Find latest remote mtime
@@ -144,14 +173,14 @@ agents.each do |agent|
         execute :mkdir, "-p", remote_dir
       end
       run_locally do
-        execute :rsync, "-az", "--delete", "#{local_dir}/", remote_spec
+        execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
       end
       puts "  Done."
     elsif answer == "d"
       puts "  Downloading remote -> local..."
       run_locally do
         execute :mkdir, "-p", local_dir
-        execute :rsync, "-az", "--delete", remote_spec, "#{local_dir}/"
+        execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
       end
       puts "  Done."
     else
@@ -167,7 +196,7 @@ agents.each do |agent|
         execute :mkdir, "-p", remote_dir
       end
       run_locally do
-        execute :rsync, "-az", "--delete", "#{local_dir}/", remote_spec
+        execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
       end
       puts "  Done."
     else
@@ -181,7 +210,7 @@ agents.each do |agent|
       puts "  Downloading remote -> local..."
       run_locally do
         execute :mkdir, "-p", local_dir
-        execute :rsync, "-az", "--delete", remote_spec, "#{local_dir}/"
+        execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
       end
       puts "  Done."
     else
