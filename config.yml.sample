@@ -1,0 +1,10 @@
+ssh_user: debian
+remote_path: /home/debian/.openclaw
+
+hosts:
+  - 10.0.0.1 # Replaced by ENV["HOSTS"] in .env
+
+agents:
+  - name: my-agent
+    source: workspaces/workspace-my-agent
+    target: workspace

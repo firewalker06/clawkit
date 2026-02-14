@@ -1,0 +1,8 @@
+# Environment
+.env
+
+# User config (use config.yml.sample as template)
+config.yml
+
+# Workspaces contain personal agent data
+workspaces/

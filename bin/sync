@@ -1,0 +1,201 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+ENV["BUNDLE_GEMFILE"] ||= File.expand_path("../Gemfile", __dir__)
+
+require "bundler/setup"
+require "sshkit"
+require "sshkit/dsl"
+require "yaml"
+include SSHKit::DSL
+
+PROJECT_DIR = File.expand_path("..", __dir__)
+
+# Load .env file if it exists
+env_file = File.join(PROJECT_DIR, ".env")
+if File.file?(env_file)
+  File.readlines(env_file).each do |line|
+    line = line.strip
+    next if line.empty? || line.start_with?("#")
+    if line =~ /\A([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\z/
+      ENV[$1] ||= $2.gsub(/\A['"]|['"]\z/, "")
+    end
+  end
+end
+
+# Load config
+config = YAML.safe_load_file(File.join(PROJECT_DIR, "config.yml"))
+ssh_user = config.fetch("ssh_user", "debian")
+remote_path = config.fetch("remote_path")
+agents = config.fetch("agents")
+
+# Validate config values contain only safe path characters
+def safe_path?(path)
+  path.match?(/\A[\w.\/-]+\z/)
+end
+
+abort "Error: Invalid remote_path: #{remote_path}" unless safe_path?(remote_path)
+agents.each do |agent|
+  abort "Error: Invalid source for #{agent["name"]}: #{agent["source"]}" unless safe_path?(agent["source"])
+  abort "Error: Invalid target for #{agent["name"]}: #{agent["target"]}" unless safe_path?(agent["target"])
+end
+
+hosts = if ENV["HOSTS"]
+  ENV["HOSTS"].split(",").map(&:strip)
+else
+  config.fetch("hosts")
+end
+
+abort "Error: No hosts configured." if hosts.empty?
+
+# Filter agents if names given as arguments
+if ARGV.any?
+  selected = agents.select { |a| ARGV.include?(a["name"]) }
+  unknown = ARGV - agents.map { |a| a["name"] }
+  abort "Error: Unknown agent(s): #{unknown.join(", ")}\nAvailable: #{agents.map { |a| a["name"] }.join(", ")}" unless unknown.empty?
+  agents = selected
+end
+
+abort "Error: No agents to sync." if agents.empty?
+
+# Use first host only
+host = hosts.first
+
+puts "Syncing:  #{agents.map { |a| a["name"] }.join(", ")}"
+puts "Host:    #{host}"
+puts ""
+
+SSHKit.config.default_env = {
+  path: "/home/debian/.npm-global/bin:$PATH"
+}
+
+server = SSHKit::Host.new("#{ssh_user}@#{host}")
+
+# Stop gateway before syncing
+on server do
+  info "Stopping openclaw gateway..."
+  execute :openclaw, "gateway", "stop"
+end
+
+agents.each do |agent|
+  local_dir = File.join(PROJECT_DIR, agent["source"])
+  remote_dir = "#{remote_path}/#{agent["target"]}"
+  remote_spec = "#{ssh_user}@#{host}:#{remote_dir}/"
+
+  # Dry-run rsync in both directions to detect real differences
+  local_changes = []
+  remote_changes = []
+  local_mtime = nil
+  remote_mtime = nil
+
+  run_locally do
+    if Dir.exist?(local_dir)
+      out = capture(:rsync, "-az", "--delete", "--dry-run", "--itemize-changes",
+        "#{local_dir}/", remote_spec, raise_on_non_zero_exit: false)
+      local_changes = out.lines.map(&:strip).reject(&:empty?)
+
+      # Find latest local mtime
+      local_files = Dir.glob("#{local_dir}/**/*").select { |f| File.file?(f) }
+      local_mtime = local_files.map { |f| File.mtime(f) }.max
+    end
+
+    out = capture(:rsync, "-az", "--delete", "--dry-run", "--itemize-changes",
+      remote_spec, "#{local_dir}/", raise_on_non_zero_exit: false)
+    remote_changes = out.lines.map(&:strip).reject(&:empty?)
+  end
+
+  # Find latest remote mtime
+  on server do
+    out = capture(:find, remote_dir, "-type", "f", "-printf", "%T@\\n", raise_on_non_zero_exit: false)
+    timestamps = out.lines.map(&:strip).reject(&:empty?).map(&:to_f)
+    remote_mtime = Time.at(timestamps.max) if timestamps.any?
+  end
+
+  has_local_changes = local_changes.any?
+  has_remote_changes = remote_changes.any?
+
+  puts "#{agent["name"]}:"
+
+  if local_mtime || remote_mtime
+    local_label = local_mtime ? local_mtime.strftime("%Y-%m-%d %H:%M:%S") : "n/a"
+    remote_label = remote_mtime ? remote_mtime.strftime("%Y-%m-%d %H:%M:%S") : "n/a"
+    newest = if local_mtime && remote_mtime
+      local_mtime > remote_mtime ? "local" : "remote"
+    end
+    puts "  Latest local:  #{local_label}#{newest == "local" ? " ← newest" : ""}"
+    puts "  Latest remote: #{remote_label}#{newest == "remote" ? " ← newest" : ""}"
+  end
+
+  if !has_local_changes && !has_remote_changes
+    puts "  Already in sync."
+    puts ""
+    next
+  end
+
+  if has_local_changes && has_remote_changes
+    puts "  Both sides have differences:"
+    puts "  Local -> Remote would change #{local_changes.size} file(s)"
+    puts "  Remote -> Local would change #{remote_changes.size} file(s)"
+    print "  Sync direction? [u]pload / [d]ownload / [s]kip: "
+    answer = $stdin.gets&.strip&.downcase
+    if answer == "u"
+      puts "  Uploading local -> remote..."
+      on server do
+        execute :mkdir, "-p", remote_dir
+      end
+      run_locally do
+        execute :rsync, "-az", "--delete", "#{local_dir}/", remote_spec
+      end
+      puts "  Done."
+    elsif answer == "d"
+      puts "  Downloading remote -> local..."
+      run_locally do
+        execute :mkdir, "-p", local_dir
+        execute :rsync, "-az", "--delete", remote_spec, "#{local_dir}/"
+      end
+      puts "  Done."
+    else
+      puts "  Skipped."
+    end
+  elsif has_local_changes
+    puts "  Local has changes (#{local_changes.size} file(s) differ)"
+    print "  Upload local -> remote? [y/N] "
+    answer = $stdin.gets&.strip
+    if answer&.downcase == "y"
+      puts "  Uploading local -> remote..."
+      on server do
+        execute :mkdir, "-p", remote_dir
+      end
+      run_locally do
+        execute :rsync, "-az", "--delete", "#{local_dir}/", remote_spec
+      end
+      puts "  Done."
+    else
+      puts "  Skipped."
+    end
+  else
+    puts "  Remote has changes (#{remote_changes.size} file(s) differ)"
+    print "  Download remote -> local? [y/N] "
+    answer = $stdin.gets&.strip
+    if answer&.downcase == "y"
+      puts "  Downloading remote -> local..."
+      run_locally do
+        execute :mkdir, "-p", local_dir
+        execute :rsync, "-az", "--delete", remote_spec, "#{local_dir}/"
+      end
+      puts "  Done."
+    else
+      puts "  Skipped."
+    end
+  end
+
+  puts ""
+end
+
+# Start gateway after syncing
+on server do
+  info "Starting openclaw gateway..."
+  execute :openclaw, "gateway", "start"
+end
+
+puts "Sync complete."
