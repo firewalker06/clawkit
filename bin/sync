@@ -7,7 +7,160 @@ require "bundler/setup"
 require "sshkit"
 require "sshkit/dsl"
 require "yaml"
+require "tmpdir"
+require "fileutils"
+require "open3"
+require "tty-spinner"
+require "tty-pager"
 include SSHKit::DSL
+
+# Run a block with a spinner, return the block's result.
+def spin(status_text)
+  spinner = TTY::Spinner.new("[:spinner] #{status_text}", format: :dots, hide_cursor: true)
+  spinner.auto_spin
+  result = yield
+  spinner.success
+  result
+rescue => e
+  spinner.error
+  raise
+end
+
+def ansi(code, text)
+  "\e[#{code}m#{text}\e[0m"
+end
+
+def colorize_diff(text)
+  text.lines.map do |line|
+    line = line.chomp
+    case line
+    when /\A---/, /\A\+\+\+/ then ansi("1", line)      # bold (file headers)
+    when /\A@@/               then ansi("36", line)     # cyan (hunk headers)
+    when /\A\+/               then ansi("32", line)     # green (additions)
+    when /\A-/                then ansi("31", line)      # red (deletions)
+    else                           ansi("2", line)      # dim (context)
+    end
+  end.join("\n")
+end
+
+# Parse rsync itemize lines into categorized file lists.
+# Returns { modified: [...], new: [...], deleted: [...] }
+def parse_itemize(lines)
+  result = { modified: [], new: [], deleted: [] }
+  lines.each do |line|
+    case line
+    when /\A\*deleting\s+(.+)/
+      result[:deleted] << $1.strip
+    when /\A[<>]f\+{3,}\S*\s+(.+)/
+      result[:new] << $1.strip
+    when /\A[<>]f\S*\s+(.+)/
+      result[:modified] << $1.strip
+    when /\Acd\+{3,}\S*\s+(.+)/
+      # new directory, skip
+    end
+  end
+  result
+end
+
+def binary_file?(path)
+  return false unless File.exist?(path)
+  # Read first 8KB and check for null bytes
+  chunk = File.binread(path, 8192)
+  chunk&.include?("\x00") || false
+end
+
+# Generate unified diff output for changed files.
+# Shows each file once with local/ and remote/ labels.
+# local_dir: path to local agent directory
+# remote_dir: path to temp directory with remote copies
+# local_files: parsed itemize from local→remote dry-run
+# remote_files: parsed itemize from remote→local dry-run
+def generate_diffs(local_dir, remote_dir, local_files, remote_files)
+  sections = []
+
+  # Modified files — deduplicate across both directions, show each file once
+  modified = (local_files[:modified] + remote_files[:modified]).uniq
+  modified.each do |file|
+    local_path = File.join(local_dir, file)
+    remote_path = File.join(remote_dir, file)
+    if binary_file?(local_path) || binary_file?(remote_path)
+      sections << "Binary file differs: #{file}"
+    elsif File.exist?(remote_path) && File.exist?(local_path)
+      diff, _ = Open3.capture2("diff", "-u", "--label", "local/#{file}", local_path, "--label", "remote/#{file}", remote_path)
+      sections << diff unless diff.empty?
+    end
+  end
+
+  # New files only on local (local→remote dry-run shows them as new)
+  local_files[:new].each do |file|
+    local_path = File.join(local_dir, file)
+    next unless File.exist?(local_path)
+    if binary_file?(local_path)
+      sections << "Binary file (local only): #{file}"
+    else
+      content = File.read(local_path)
+      lines = content.lines.map { |l| "+#{l.chomp}" }
+      sections << "--- /dev/null\n+++ local/#{file}\n@@ -0,0 +1,#{lines.size} @@\n#{lines.join("\n")}"
+    end
+  end
+
+  # New files only on remote (remote→local dry-run shows them as new)
+  remote_files[:new].each do |file|
+    remote_path = File.join(remote_dir, file)
+    next unless File.exist?(remote_path)
+    if binary_file?(remote_path)
+      sections << "Binary file (remote only): #{file}"
+    else
+      content = File.read(remote_path)
+      lines = content.lines.map { |l| "+#{l.chomp}" }
+      sections << "--- /dev/null\n+++ remote/#{file}\n@@ -0,0 +1,#{lines.size} @@\n#{lines.join("\n")}"
+    end
+  end
+
+  # Deleted from local (local→remote dry-run shows *deleting)
+  local_files[:deleted].each do |file|
+    remote_path = File.join(remote_dir, file)
+    next unless File.exist?(remote_path)
+    if binary_file?(remote_path)
+      sections << "Binary file (deleted from local): #{file}"
+    else
+      content = File.read(remote_path)
+      lines = content.lines.map { |l| "-#{l.chomp}" }
+      sections << "--- remote/#{file}\n+++ /dev/null\n@@ -1,#{lines.size} +0,0 @@\n#{lines.join("\n")}"
+    end
+  end
+
+  # Deleted from remote (remote→local dry-run shows *deleting)
+  remote_files[:deleted].each do |file|
+    local_path = File.join(local_dir, file)
+    next unless File.exist?(local_path)
+    if binary_file?(local_path)
+      sections << "Binary file (deleted from remote): #{file}"
+    else
+      content = File.read(local_path)
+      lines = content.lines.map { |l| "-#{l.chomp}" }
+      sections << "--- local/#{file}\n+++ /dev/null\n@@ -1,#{lines.size} +0,0 @@\n#{lines.join("\n")}"
+    end
+  end
+
+  sections.join("\n")
+end
+
+# Silence SSHKit logger during spinner phases to prevent log lines from breaking the output.
+class NullOutput
+  def <<(_); end
+  def log_command_start(_); end
+  def log_command_data(*, **); end
+  def log_command_exit(_); end
+end
+
+def with_silent_sshkit
+  old_output = SSHKit.config.output
+  SSHKit.config.output = NullOutput.new
+  yield
+ensure
+  SSHKit.config.output = old_output
+end
 
 PROJECT_DIR = File.expand_path("..", __dir__)
 
@@ -71,10 +224,15 @@ SSHKit.config.default_env = {
 server = SSHKit::Host.new("#{ssh_user}@#{host}")
 
 # Stop gateway before syncing
-on server do
-  info "Stopping openclaw gateway..."
-  execute :openclaw, "gateway", "stop"
+with_silent_sshkit do
+  spin("Stopping openclaw gateway...") do
+    on server do
+      execute :openclaw, "gateway", "stop"
+    end
+  end
 end
+
+begin
 
 agents.each do |agent|
   local_dir = File.join(PROJECT_DIR, agent["source"])
@@ -106,39 +264,76 @@ agents.each do |agent|
   # A line like ".f..T....." means "file exists on both sides, content is identical,
   # only the timestamp differs" — not a real change. We filter these out so only
   # lines with actual content/size/deletion differences are counted.
-  local_changes = []
-  remote_changes = []
-  local_mtime = nil
-  remote_mtime = nil
 
   # Filter that ignores timestamp-only differences (no actual content change).
   # Matches lines like ".f..T....." or ".d..T....." where only the T flag is set.
   timestamp_only = /\A\.[fd]\.\.T\.+\s/
 
-  run_locally do
-    # Check what local -> remote would transfer (i.e. what local has that remote doesn't)
-    if Dir.exist?(local_dir)
-      out = capture(:rsync, "-rlz", "--checksum", "--delete", "--dry-run", "--itemize-changes",
-        "#{local_dir}/", remote_spec, raise_on_non_zero_exit: false)
-      local_changes = out.lines.map(&:strip).reject { |l| l.empty? || l.match?(timestamp_only) }
+  tmpdir = Dir.mktmpdir("clawkit-sync-")
 
-      # Find latest local mtime
-      local_files = Dir.glob("#{local_dir}/**/*").select { |f| File.file?(f) }
-      local_mtime = local_files.map { |f| File.mtime(f) }.max
+  result = with_silent_sshkit do
+    spin("Checking #{agent["name"]} for changes...") do
+      lc = []
+      rc = []
+      lm = nil
+      rm = nil
+
+      run_locally do
+        # Check what local -> remote would transfer (i.e. what local has that remote doesn't)
+        if Dir.exist?(local_dir)
+          out = capture(:rsync, "-rlz", "--checksum", "--delete", "--dry-run", "--itemize-changes",
+            "#{local_dir}/", remote_spec, raise_on_non_zero_exit: false)
+          lc = out.lines.map(&:strip).reject { |l| l.empty? || l.match?(timestamp_only) }
+
+          # Find latest local mtime
+          local_files = Dir.glob("#{local_dir}/**/*").select { |f| File.file?(f) }
+          lm = local_files.map { |f| File.mtime(f) }.max
+        end
+
+        # Check what remote -> local would transfer (i.e. what remote has that local doesn't)
+        out = capture(:rsync, "-rlz", "--checksum", "--delete", "--dry-run", "--itemize-changes",
+          remote_spec, "#{local_dir}/", raise_on_non_zero_exit: false)
+        rc = out.lines.map(&:strip).reject { |l| l.empty? || l.match?(timestamp_only) }
+      end
+
+      # Find latest remote mtime
+      on server do
+        out = capture(:find, remote_dir, "-type", "f", "-printf", "%T@\\n", raise_on_non_zero_exit: false)
+        timestamps = out.lines.map(&:strip).reject(&:empty?).map(&:to_f)
+        rm = Time.at(timestamps.max) if timestamps.any?
+      end
+
+      # Parse changed filenames and fetch remote copies for diffing
+      local_parsed = parse_itemize(lc)
+      remote_parsed = parse_itemize(rc)
+      all_remote_files = (local_parsed[:modified] + local_parsed[:deleted] +
+                          remote_parsed[:modified] + remote_parsed[:new]).uniq
+
+      diff_output = ""
+      if all_remote_files.any?
+        # Write file list and fetch remote copies in one rsync call
+        files_list = File.join(tmpdir, ".files-from")
+        File.write(files_list, all_remote_files.join("\n") + "\n")
+
+        run_locally do
+          execute :rsync, "-rlz", "--checksum", "--files-from", files_list,
+            remote_spec, "#{tmpdir}/", raise_on_non_zero_exit: false
+        end
+
+        diff_output = generate_diffs(local_dir, tmpdir, local_parsed, remote_parsed)
+      else
+        diff_output = generate_diffs(local_dir, tmpdir, local_parsed, remote_parsed)
+      end
+
+      { local_changes: lc, remote_changes: rc, local_mtime: lm, remote_mtime: rm, diff_output: diff_output }
     end
-
-    # Check what remote -> local would transfer (i.e. what remote has that local doesn't)
-    out = capture(:rsync, "-rlz", "--checksum", "--delete", "--dry-run", "--itemize-changes",
-      remote_spec, "#{local_dir}/", raise_on_non_zero_exit: false)
-    remote_changes = out.lines.map(&:strip).reject { |l| l.empty? || l.match?(timestamp_only) }
   end
 
-  # Find latest remote mtime
-  on server do
-    out = capture(:find, remote_dir, "-type", "f", "-printf", "%T@\\n", raise_on_non_zero_exit: false)
-    timestamps = out.lines.map(&:strip).reject(&:empty?).map(&:to_f)
-    remote_mtime = Time.at(timestamps.max) if timestamps.any?
-  end
+  local_changes = result[:local_changes]
+  remote_changes = result[:remote_changes]
+  local_mtime = result[:local_mtime]
+  remote_mtime = result[:remote_mtime]
+  diff_output = result[:diff_output]
 
   has_local_changes = local_changes.any?
   has_remote_changes = remote_changes.any?
@@ -158,8 +353,19 @@ agents.each do |agent|
   if !has_local_changes && !has_remote_changes
     puts "  Already in sync."
     puts ""
+    FileUtils.rm_rf(tmpdir)
     next
   end
+
+  # Show unified diff in a pager
+  pager_text = if diff_output.empty?
+    local_changes.concat(remote_changes).join("\n")
+  else
+    colorize_diff(diff_output)
+  end
+  TTY::Pager.new(command: "less -R").page(pager_text)
+
+  FileUtils.rm_rf(tmpdir)
 
   if has_local_changes && has_remote_changes
     puts "  Both sides have differences:"
@@ -168,19 +374,25 @@ agents.each do |agent|
     print "  Sync direction? [u]pload / [d]ownload / [s]kip: "
     answer = $stdin.gets&.strip&.downcase
     if answer == "u"
-      puts "  Uploading local -> remote..."
-      on server do
-        execute :mkdir, "-p", remote_dir
-      end
-      run_locally do
-        execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
+      with_silent_sshkit do
+        spin("Uploading local -> remote...") do
+          on server do
+            execute :mkdir, "-p", remote_dir
+          end
+          run_locally do
+            execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
+          end
+        end
       end
       puts "  Done."
     elsif answer == "d"
-      puts "  Downloading remote -> local..."
-      run_locally do
-        execute :mkdir, "-p", local_dir
-        execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
+      with_silent_sshkit do
+        spin("Downloading remote -> local...") do
+          run_locally do
+            execute :mkdir, "-p", local_dir
+            execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
+          end
+        end
       end
       puts "  Done."
     else
@@ -191,12 +403,15 @@ agents.each do |agent|
     print "  Upload local -> remote? [y/N] "
     answer = $stdin.gets&.strip
     if answer&.downcase == "y"
-      puts "  Uploading local -> remote..."
-      on server do
-        execute :mkdir, "-p", remote_dir
-      end
-      run_locally do
-        execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
+      with_silent_sshkit do
+        spin("Uploading local -> remote...") do
+          on server do
+            execute :mkdir, "-p", remote_dir
+          end
+          run_locally do
+            execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
+          end
+        end
       end
       puts "  Done."
     else
@@ -207,10 +422,13 @@ agents.each do |agent|
     print "  Download remote -> local? [y/N] "
     answer = $stdin.gets&.strip
     if answer&.downcase == "y"
-      puts "  Downloading remote -> local..."
-      run_locally do
-        execute :mkdir, "-p", local_dir
-        execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
+      with_silent_sshkit do
+        spin("Downloading remote -> local...") do
+          run_locally do
+            execute :mkdir, "-p", local_dir
+            execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
+          end
+        end
       end
       puts "  Done."
     else
@@ -221,10 +439,17 @@ agents.each do |agent|
   puts ""
 end
 
-# Start gateway after syncing
-on server do
-  info "Starting openclaw gateway..."
-  execute :openclaw, "gateway", "start"
+rescue Interrupt
+  puts "\n  Aborted."
+ensure
+  # Always restart the gateway, even if interrupted
+  with_silent_sshkit do
+    spin("Starting openclaw gateway...") do
+      on server do
+        execute :openclaw, "gateway", "start"
+      end
+    end
+  end
 end
 
 puts "Sync complete."

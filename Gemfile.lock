@@ -16,6 +16,20 @@ GEM
       net-sftp (>= 2.1.2)
       net-ssh (>= 2.8.0)
       ostruct
+    strings (0.2.1)
+      strings-ansi (~> 0.2)
+      unicode-display_width (>= 1.5, < 3.0)
+      unicode_utils (~> 1.4)
+    strings-ansi (0.2.0)
+    tty-cursor (0.7.1)
+    tty-pager (0.14.0)
+      strings (~> 0.2.0)
+      tty-screen (~> 0.8)
+    tty-screen (0.8.2)
+    tty-spinner (0.9.3)
+      tty-cursor (~> 0.7)
+    unicode-display_width (2.6.0)
+    unicode_utils (1.4.0)
 
 PLATFORMS
   arm64-darwin-24
@@ -23,6 +37,8 @@ PLATFORMS
 
 DEPENDENCIES
   sshkit (~> 1.25)
+  tty-pager (~> 0.14)
+  tty-spinner (~> 0.9)
 
 BUNDLED WITH
    2.7.2
