@@ -12,6 +12,8 @@ require "fileutils"
 require "open3"
 require "tty-spinner"
 require "tty-pager"
+require "tty-prompt"
+require "tty-table"
 include SSHKit::DSL
 
 # Run a block with a spinner, return the block's result.
@@ -344,101 +346,147 @@ agents.each do |agent|
   has_local_changes = local_changes.any?
   has_remote_changes = remote_changes.any?
 
-  puts "#{agent["name"]}:"
-
-  if local_mtime || remote_mtime
-    local_label = local_mtime ? local_mtime.strftime("%Y-%m-%d %H:%M:%S") : "n/a"
-    remote_label = remote_mtime ? remote_mtime.strftime("%Y-%m-%d %H:%M:%S") : "n/a"
-    newest = if local_mtime && remote_mtime
-      local_mtime > remote_mtime ? "local" : "remote"
+  local_label = local_mtime ? local_mtime.strftime("%Y-%m-%d %H:%M:%S") : "n/a"
+  remote_label = remote_mtime ? remote_mtime.strftime("%Y-%m-%d %H:%M:%S") : "n/a"
+  if local_mtime && remote_mtime
+    if local_mtime >= remote_mtime
+      local_label = ansi("32", local_label)
+    else
+      remote_label = ansi("32", remote_label)
     end
-    puts "  Latest local:  #{local_label}#{newest == "local" ? " ← newest" : ""}"
-    puts "  Latest remote: #{remote_label}#{newest == "remote" ? " ← newest" : ""}"
+  end
+
+  table = TTY::Table.new(
+    header: [agent["name"], "Local", "Remote"],
+    rows: [
+      ["Latest", local_label, remote_label],
+      ["Changes", "#{local_changes.size} file(s)", "#{remote_changes.size} file(s)"]
+    ]
+  )
+  puts ""
+  puts table.render(:unicode, padding: [0, 1])
+  puts ""
+
+  status = if !has_local_changes && !has_remote_changes
+    "In sync"
+  elsif has_local_changes && has_remote_changes
+    "Both sides differ"
+  elsif has_local_changes
+    "Local has changes"
+  else
+    "Remote has changes"
   end
 
   if !has_local_changes && !has_remote_changes
-    puts "  Already in sync."
+    puts "#{status}."
     puts ""
     FileUtils.rm_rf(tmpdir)
     next
   end
 
-  # Show unified diff in a pager
   pager_text = if diff_output.empty?
     local_changes.concat(remote_changes).join("\n")
   else
     colorize_diff(diff_output)
   end
-  TTY::Pager.new(command: "less -R").page(pager_text)
 
   FileUtils.rm_rf(tmpdir)
 
+  prompt = TTY::Prompt.new
+
   if has_local_changes && has_remote_changes
-    puts "  Both sides have differences:"
-    puts "  Local -> Remote would change #{local_changes.size} file(s)"
-    puts "  Remote -> Local would change #{remote_changes.size} file(s)"
-    print "  Sync direction? [u]pload / [d]ownload / [s]kip: "
-    answer = $stdin.gets&.strip&.downcase
-    if answer == "u"
-      with_silent_sshkit do
-        spin("Uploading local -> remote...") do
-          on server do
-            execute :mkdir, "-p", remote_dir
-          end
-          run_locally do
-            execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
+    loop do
+      answer = prompt.select("#{status}.\nSync direction?", enum: ")") do |menu|
+        menu.choice "Upload local -> remote", :upload
+        menu.choice "Download remote -> local", :download
+        menu.choice "Compare (view diff)", :compare
+        menu.choice "Skip", :skip
+      end
+      if answer == :compare
+        TTY::Pager.new(command: "less -R").page(pager_text)
+        next
+      end
+      case answer
+      when :upload
+        with_silent_sshkit do
+          spin("Uploading local -> remote...") do
+            on server do
+              execute :mkdir, "-p", remote_dir
+            end
+            run_locally do
+              execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
+            end
           end
         end
-      end
-      puts "  Done."
-    elsif answer == "d"
-      with_silent_sshkit do
-        spin("Downloading remote -> local...") do
-          run_locally do
-            execute :mkdir, "-p", local_dir
-            execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
+        puts "  Done."
+      when :download
+        with_silent_sshkit do
+          spin("Downloading remote -> local...") do
+            run_locally do
+              execute :mkdir, "-p", local_dir
+              execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
+            end
           end
         end
+        puts "  Done."
+      else
+        puts "  Skipped."
       end
-      puts "  Done."
-    else
-      puts "  Skipped."
+      break
     end
   elsif has_local_changes
-    puts "  Local has changes (#{local_changes.size} file(s) differ)"
-    print "  Upload local -> remote? [y/N] "
-    answer = $stdin.gets&.strip
-    if answer&.downcase == "y"
-      with_silent_sshkit do
-        spin("Uploading local -> remote...") do
-          on server do
-            execute :mkdir, "-p", remote_dir
-          end
-          run_locally do
-            execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
+    loop do
+      answer = prompt.select("#{status}. Upload local -> remote?", enum: ")") do |menu|
+        menu.choice "Upload", :upload
+        menu.choice "Compare (view diff)", :compare
+        menu.choice "Skip", :skip
+      end
+      if answer == :compare
+        TTY::Pager.new(command: "less -R").page(pager_text)
+        next
+      end
+      if answer == :upload
+        with_silent_sshkit do
+          spin("Uploading local -> remote...") do
+            on server do
+              execute :mkdir, "-p", remote_dir
+            end
+            run_locally do
+              execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
+            end
           end
         end
+        puts "  Done."
+      else
+        puts "  Skipped."
       end
-      puts "  Done."
-    else
-      puts "  Skipped."
+      break
     end
   else
-    puts "  Remote has changes (#{remote_changes.size} file(s) differ)"
-    print "  Download remote -> local? [y/N] "
-    answer = $stdin.gets&.strip
-    if answer&.downcase == "y"
-      with_silent_sshkit do
-        spin("Downloading remote -> local...") do
-          run_locally do
-            execute :mkdir, "-p", local_dir
-            execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
+    loop do
+      answer = prompt.select("#{status}. Download remote -> local?", enum: ")") do |menu|
+        menu.choice "Download", :download
+        menu.choice "Compare (view diff)", :compare
+        menu.choice "Skip", :skip
+      end
+      if answer == :compare
+        TTY::Pager.new(command: "less -R").page(pager_text)
+        next
+      end
+      if answer == :download
+        with_silent_sshkit do
+          spin("Downloading remote -> local...") do
+            run_locally do
+              execute :mkdir, "-p", local_dir
+              execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
+            end
           end
         end
+        puts "  Done."
+      else
+        puts "  Skipped."
       end
-      puts "  Done."
-    else
-      puts "  Skipped."
+      break
     end
   end
 
