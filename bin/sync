@@ -322,12 +322,18 @@ agents.each do |agent|
   has_local_changes = local_changes.any?
   has_remote_changes = remote_changes.any?
 
+  if !has_local_changes && !has_remote_changes
+    puts PASTEL.green("[✔] Skipping: #{agent["name"]} in sync.")
+    FileUtils.rm_rf(tmpdir)
+    next
+  end
+
   local_label = local_mtime ? local_mtime.strftime("%Y-%m-%d %H:%M:%S") : "n/a"
   remote_label = remote_mtime ? remote_mtime.strftime("%Y-%m-%d %H:%M:%S") : "n/a"
   if local_mtime && remote_mtime
-    if local_mtime >= remote_mtime
+    if local_mtime > remote_mtime
       local_label = PASTEL.green(local_label)
-    else
+    elsif remote_mtime > local_mtime
       remote_label = PASTEL.green(remote_label)
     end
   end
@@ -343,21 +349,12 @@ agents.each do |agent|
   puts table.render(:unicode, padding: [0, 1])
   puts ""
 
-  status = if !has_local_changes && !has_remote_changes
-    "In sync"
-  elsif has_local_changes && has_remote_changes
+  status = if has_local_changes && has_remote_changes
     "Both sides differ"
   elsif has_local_changes
     "Local has changes"
   else
     "Remote has changes"
-  end
-
-  if !has_local_changes && !has_remote_changes
-    puts "#{status}."
-    puts ""
-    FileUtils.rm_rf(tmpdir)
-    next
   end
 
   pager_text = if diff_output.empty?
@@ -482,4 +479,4 @@ ensure
   end
 end
 
-puts "Sync complete."
+puts "[✔] Sync complete."
