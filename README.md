@@ -4,7 +4,9 @@
   <img src="clawkit.jpeg" alt="Clawkit Brand" width="400"/>
 </div>
 
-Clawkit simplifies working with openclaw agents workspace using [sshkit](https://github.com/capistrano/sshkit).
+Clawkit simplifies managing openclaw agents workspace using [sshkit](https://github.com/capistrano/sshkit). Useful to know when your agents memory have so many garbage context or when their `SOUL.md` suddenly changed 🤖.
+
+[![preview](https://asciinema.org/a/788239.svg)](https://asciinema.org/a/788239)
 
 ## Prerequisites
 
