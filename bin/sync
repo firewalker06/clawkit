@@ -64,6 +64,7 @@ end
 
 def binary_file?(path)
   return false unless File.exist?(path)
+  return false if File.directory?(path)
   # Read first 8KB and check for null bytes
   chunk = File.binread(path, 8192)
   chunk&.include?("\x00") || false
@@ -83,6 +84,7 @@ def generate_diffs(local_dir, remote_dir, local_files, remote_files)
   modified.each do |file|
     local_path = File.join(local_dir, file)
     remote_path = File.join(remote_dir, file)
+    next if File.directory?(local_path) || File.directory?(remote_path)
     if binary_file?(local_path) || binary_file?(remote_path)
       sections << "Binary file differs: #{file}"
     elsif File.exist?(remote_path) && File.exist?(local_path)
@@ -95,6 +97,7 @@ def generate_diffs(local_dir, remote_dir, local_files, remote_files)
   local_files[:new].each do |file|
     local_path = File.join(local_dir, file)
     next unless File.exist?(local_path)
+    next if File.directory?(local_path)
     if binary_file?(local_path)
       sections << "Binary file (local only): #{file}"
     else
@@ -108,6 +111,7 @@ def generate_diffs(local_dir, remote_dir, local_files, remote_files)
   remote_files[:new].each do |file|
     remote_path = File.join(remote_dir, file)
     next unless File.exist?(remote_path)
+    next if File.directory?(remote_path)
     if binary_file?(remote_path)
       sections << "Binary file (remote only): #{file}"
     else
@@ -121,6 +125,7 @@ def generate_diffs(local_dir, remote_dir, local_files, remote_files)
   local_files[:deleted].each do |file|
     remote_path = File.join(remote_dir, file)
     next unless File.exist?(remote_path)
+    next if File.directory?(remote_path)
     if binary_file?(remote_path)
       sections << "Binary file (deleted from local): #{file}"
     else
@@ -134,6 +139,7 @@ def generate_diffs(local_dir, remote_dir, local_files, remote_files)
   remote_files[:deleted].each do |file|
     local_path = File.join(local_dir, file)
     next unless File.exist?(local_path)
+    next if File.directory?(local_path)
     if binary_file?(local_path)
       sections << "Binary file (deleted from remote): #{file}"
     else
