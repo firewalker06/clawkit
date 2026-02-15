@@ -6,7 +6,6 @@ ENV["BUNDLE_GEMFILE"] ||= File.expand_path("../Gemfile", __dir__)
 require "bundler/setup"
 require "sshkit"
 require "sshkit/dsl"
-require "yaml"
 require "tmpdir"
 require "fileutils"
 require "open3"
@@ -14,7 +13,12 @@ require "tty-spinner"
 require "tty-pager"
 require "tty-prompt"
 require "tty-table"
+require "pastel"
+require_relative "../lib/clawkit"
+
 include SSHKit::DSL
+
+PASTEL = Pastel.new
 
 # Run a block with a spinner, return the block's result.
 def spin(status_text)
@@ -28,19 +32,15 @@ rescue => e
   raise
 end
 
-def ansi(code, text)
-  "\e[#{code}m#{text}\e[0m"
-end
-
 def colorize_diff(text)
   text.lines.map do |line|
     line = line.chomp
     case line
-    when /\A---/, /\A\+\+\+/ then ansi("1", line)      # bold (file headers)
-    when /\A@@/               then ansi("36", line)     # cyan (hunk headers)
-    when /\A\+/               then ansi("32", line)     # green (additions)
-    when /\A-/                then ansi("31", line)      # red (deletions)
-    else                           ansi("2", line)      # dim (context)
+    when /\A---/, /\A\+\+\+/ then PASTEL.bold(line)
+    when /\A@@/               then PASTEL.cyan(line)
+    when /\A\+/               then PASTEL.green(line)
+    when /\A-/                then PASTEL.red(line)
+    else                           PASTEL.dim(line)
     end
   end.join("\n")
 end
@@ -170,43 +170,19 @@ ensure
   SSHKit.config.output = old_output
 end
 
-PROJECT_DIR = File.expand_path("..", __dir__)
-
-# Load .env file if it exists
-env_file = File.join(PROJECT_DIR, ".env")
-if File.file?(env_file)
-  File.readlines(env_file).each do |line|
-    line = line.strip
-    next if line.empty? || line.start_with?("#")
-    if line =~ /\A([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\z/
-      ENV[$1] ||= $2.gsub(/\A['"]|['"]\z/, "")
-    end
-  end
-end
-
-# Load config
-config = YAML.safe_load_file(File.join(PROJECT_DIR, "config.yml"))
+Clawkit.load_env
+config = Clawkit.load_config
 ssh_user = config.fetch("ssh_user", "debian")
 remote_path = config.fetch("remote_path")
 agents = config.fetch("agents")
 
-# Validate config values contain only safe path characters
-def safe_path?(path)
-  path.match?(/\A[\w.\/-]+\z/)
-end
-
-abort "Error: Invalid remote_path: #{remote_path}" unless safe_path?(remote_path)
+abort "Error: Invalid remote_path: #{remote_path}" unless Clawkit.safe_path?(remote_path)
 agents.each do |agent|
-  abort "Error: Invalid source for #{agent["name"]}: #{agent["source"]}" unless safe_path?(agent["source"])
-  abort "Error: Invalid target for #{agent["name"]}: #{agent["target"]}" unless safe_path?(agent["target"])
-end
-hosts = if ENV["HOSTS"]
-  ENV["HOSTS"].split(",").map(&:strip)
-else
-  config.fetch("hosts")
+  abort "Error: Invalid source for #{agent["name"]}: #{agent["source"]}" unless Clawkit.safe_path?(agent["source"])
+  abort "Error: Invalid target for #{agent["name"]}: #{agent["target"]}" unless Clawkit.safe_path?(agent["target"])
 end
 
-abort "Error: No hosts configured." if hosts.empty?
+hosts = Clawkit.resolve_hosts(config)
 
 # Filter agents if names given as arguments
 if ARGV.any?
@@ -243,7 +219,7 @@ end
 begin
 
 agents.each do |agent|
-  local_dir = File.join(PROJECT_DIR, agent["source"])
+  local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
   remote_dir = "#{remote_path}/#{agent["target"]}"
   remote_spec = "#{ssh_user}@#{host}:#{remote_dir}/"
 
@@ -350,9 +326,9 @@ agents.each do |agent|
   remote_label = remote_mtime ? remote_mtime.strftime("%Y-%m-%d %H:%M:%S") : "n/a"
   if local_mtime && remote_mtime
     if local_mtime >= remote_mtime
-      local_label = ansi("32", local_label)
+      local_label = PASTEL.green(local_label)
     else
-      remote_label = ansi("32", remote_label)
+      remote_label = PASTEL.green(remote_label)
     end
   end
 

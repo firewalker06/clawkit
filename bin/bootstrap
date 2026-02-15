@@ -6,35 +6,14 @@ ENV["BUNDLE_GEMFILE"] ||= File.expand_path("../Gemfile", __dir__)
 require "bundler/setup"
 require "sshkit"
 require "sshkit/dsl"
-require "yaml"
+require_relative "../lib/clawkit"
 
 include SSHKit::DSL
 
-PROJECT_DIR = File.expand_path("..", __dir__)
-
-# Load .env file if it exists
-env_file = File.join(PROJECT_DIR, ".env")
-if File.file?(env_file)
-  File.readlines(env_file).each do |line|
-    line = line.strip
-    next if line.empty? || line.start_with?("#")
-    if line =~ /\A([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\z/
-      ENV[$1] ||= $2.gsub(/\A['"]|['"]\z/, "")
-    end
-  end
-end
-
-# Load config
-config = YAML.safe_load_file(File.join(PROJECT_DIR, "config.yml"))
+Clawkit.load_env
+config = Clawkit.load_config
 ssh_user = config.fetch("ssh_user", "debian")
-
-hosts = if ENV["HOSTS"]
-  ENV["HOSTS"].split(",").map(&:strip)
-else
-  config.fetch("hosts")
-end
-
-abort "Error: No hosts configured." if hosts.empty?
+hosts = Clawkit.resolve_hosts(config)
 
 servers = hosts.map { |host| SSHKit::Host.new("#{ssh_user}@#{host}") }
 
