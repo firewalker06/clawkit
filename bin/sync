@@ -174,30 +174,47 @@ Clawkit.load_env
 config = Clawkit.load_config
 ssh_user = config.fetch("ssh_user", "debian")
 remote_path = config.fetch("remote_path")
-agents = config.fetch("agents")
 
 abort "Error: Invalid remote_path: #{remote_path}" unless Clawkit.safe_path?(remote_path)
-agents.each do |agent|
-  abort "Error: Invalid source for #{agent["name"]}: #{agent["source"]}" unless Clawkit.safe_path?(agent["source"])
-  abort "Error: Invalid target for #{agent["name"]}: #{agent["target"]}" unless Clawkit.safe_path?(agent["target"])
+
+# Build unified list of sync items from directories: and files: config
+sync_items = []
+
+directories = config.fetch("directories", [])
+directories.each do |dir|
+  abort "Error: Invalid source for #{dir["name"]}: #{dir["source"]}" unless Clawkit.safe_path?(dir["source"])
+  abort "Error: Invalid target for #{dir["name"]}: #{dir["target"]}" unless Clawkit.safe_path?(dir["target"])
+  sync_items << dir.merge("type" => "directory")
+end
+
+files_config = config.fetch("files", nil)
+if files_config == "*"
+  # Wildcard: sync the whole remote_path as a directory
+  sync_items << { "name" => "remote", "source" => ".openclaw", "target" => ".", "type" => "directory" }
+elsif files_config.is_a?(Array)
+  files_config.each do |file|
+    abort "Error: Invalid source for #{file["name"]}: #{file["source"]}" unless Clawkit.safe_path?(file["source"])
+    abort "Error: Invalid target for #{file["name"]}: #{file["target"]}" unless Clawkit.safe_path?(file["target"])
+    sync_items << file.merge("type" => "file")
+  end
 end
 
 hosts = Clawkit.resolve_hosts(config)
 
-# Filter agents if names given as arguments
+# Filter items if names given as arguments
 if ARGV.any?
-  selected = agents.select { |a| ARGV.include?(a["name"]) }
-  unknown = ARGV - agents.map { |a| a["name"] }
-  abort "Error: Unknown agent(s): #{unknown.join(", ")}\nAvailable: #{agents.map { |a| a["name"] }.join(", ")}" unless unknown.empty?
-  agents = selected
+  selected = sync_items.select { |a| ARGV.include?(a["name"]) }
+  unknown = ARGV - sync_items.map { |a| a["name"] }
+  abort "Error: Unknown item(s): #{unknown.join(", ")}\nAvailable: #{sync_items.map { |a| a["name"] }.join(", ")}" unless unknown.empty?
+  sync_items = selected
 end
 
-abort "Error: No agents to sync." if agents.empty?
+abort "Error: Nothing to sync." if sync_items.empty?
 
 # Use first host only
 host = hosts.first
 
-puts "Syncing:  #{agents.map { |a| a["name"] }.join(", ")}"
+puts "Syncing:  #{sync_items.map { |a| a["name"] }.join(", ")}"
 puts "Host:    #{host}"
 puts ""
 
@@ -218,10 +235,11 @@ end
 
 begin
 
-agents.each do |agent|
+sync_items.each do |agent|
+  is_file = agent["type"] == "file"
   local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
   remote_dir = "#{remote_path}/#{agent["target"]}"
-  remote_spec = "#{ssh_user}@#{host}:#{remote_dir}/"
+  remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
 
   # Dry-run rsync in both directions to figure out which side has actual content changes.
   #
@@ -255,6 +273,12 @@ agents.each do |agent|
 
   tmpdir = Dir.mktmpdir("clawkit-sync-")
 
+  # Build rsync flags based on type
+  rsync_base = is_file ? ["-lz"] : ["-rlz"]
+  rsync_dry = rsync_base + ["--checksum", "--dry-run", "--itemize-changes"]
+  rsync_dry += ["--delete"] unless is_file
+  local_spec = is_file ? local_dir : "#{local_dir}/"
+
   result = with_silent_sshkit do
     spin("Checking #{agent["name"]} for changes...") do
       lc = []
@@ -264,27 +288,36 @@ agents.each do |agent|
 
       run_locally do
         # Check what local -> remote would transfer (i.e. what local has that remote doesn't)
-        if Dir.exist?(local_dir)
-          out = capture(:rsync, "-rlz", "--checksum", "--delete", "--dry-run", "--itemize-changes",
-            "#{local_dir}/", remote_spec, raise_on_non_zero_exit: false)
+        local_exists = is_file ? File.exist?(local_dir) : Dir.exist?(local_dir)
+        if local_exists
+          out = capture(:rsync, *rsync_dry, local_spec, remote_spec, raise_on_non_zero_exit: false)
           lc = out.lines.map(&:strip).reject { |l| l.empty? || l.match?(timestamp_only) }
 
           # Find latest local mtime
-          local_files = Dir.glob("#{local_dir}/**/*").select { |f| File.file?(f) }
-          lm = local_files.map { |f| File.mtime(f) }.max
+          if is_file
+            lm = File.mtime(local_dir) if File.exist?(local_dir)
+          else
+            local_files = Dir.glob("#{local_dir}/**/*").select { |f| File.file?(f) }
+            lm = local_files.map { |f| File.mtime(f) }.max
+          end
         end
 
         # Check what remote -> local would transfer (i.e. what remote has that local doesn't)
-        out = capture(:rsync, "-rlz", "--checksum", "--delete", "--dry-run", "--itemize-changes",
-          remote_spec, "#{local_dir}/", raise_on_non_zero_exit: false)
+        out = capture(:rsync, *rsync_dry, remote_spec, local_spec, raise_on_non_zero_exit: false)
         rc = out.lines.map(&:strip).reject { |l| l.empty? || l.match?(timestamp_only) }
       end
 
       # Find latest remote mtime
       on server do
-        out = capture(:find, remote_dir, "-type", "f", "-printf", "%T@\\n", raise_on_non_zero_exit: false)
-        timestamps = out.lines.map(&:strip).reject(&:empty?).map(&:to_f)
-        rm = Time.at(timestamps.max) if timestamps.any?
+        if is_file
+          out = capture(:stat, "-c", "%Y", remote_dir, raise_on_non_zero_exit: false)
+          ts = out.strip.to_f
+          rm = Time.at(ts) if ts > 0
+        else
+          out = capture(:find, remote_dir, "-type", "f", "-printf", "%T@\\n", raise_on_non_zero_exit: false)
+          timestamps = out.lines.map(&:strip).reject(&:empty?).map(&:to_f)
+          rm = Time.at(timestamps.max) if timestamps.any?
+        end
       end
 
       # Parse changed filenames and fetch remote copies for diffing
@@ -295,13 +328,20 @@ agents.each do |agent|
 
       diff_output = ""
       if all_remote_files.any?
-        # Write file list and fetch remote copies in one rsync call
-        files_list = File.join(tmpdir, ".files-from")
-        File.write(files_list, all_remote_files.join("\n") + "\n")
+        if is_file
+          # For single file, fetch the remote copy directly
+          run_locally do
+            execute :rsync, *rsync_base, "--checksum", remote_spec, "#{tmpdir}/", raise_on_non_zero_exit: false
+          end
+        else
+          # Write file list and fetch remote copies in one rsync call
+          files_list = File.join(tmpdir, ".files-from")
+          File.write(files_list, all_remote_files.join("\n") + "\n")
 
-        run_locally do
-          execute :rsync, "-rlz", "--checksum", "--files-from", files_list,
-            remote_spec, "#{tmpdir}/", raise_on_non_zero_exit: false
+          run_locally do
+            execute :rsync, "-rlz", "--checksum", "--files-from", files_list,
+              remote_spec, "#{tmpdir}/", raise_on_non_zero_exit: false
+          end
         end
 
         diff_output = generate_diffs(local_dir, tmpdir, local_parsed, remote_parsed)
@@ -379,15 +419,18 @@ agents.each do |agent|
         TTY::Pager.new(command: "less -R").page(pager_text)
         next
       end
+      rsync_sync = rsync_base + ["--checksum"]
+      rsync_sync += ["--delete"] unless is_file
+
       case answer
       when :upload
         with_silent_sshkit do
           spin("Uploading local -> remote...") do
             on server do
-              execute :mkdir, "-p", remote_dir
+              execute :mkdir, "-p", is_file ? File.dirname(remote_dir) : remote_dir
             end
             run_locally do
-              execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
+              execute :rsync, *rsync_sync, local_spec, remote_spec
             end
           end
         end
@@ -396,8 +439,8 @@ agents.each do |agent|
         with_silent_sshkit do
           spin("Downloading remote -> local...") do
             run_locally do
-              execute :mkdir, "-p", local_dir
-              execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
+              execute :mkdir, "-p", is_file ? File.dirname(local_dir) : local_dir
+              execute :rsync, *rsync_sync, remote_spec, local_spec
             end
           end
         end
@@ -418,14 +461,17 @@ agents.each do |agent|
         TTY::Pager.new(command: "less -R").page(pager_text)
         next
       end
+      rsync_sync = rsync_base + ["--checksum"]
+      rsync_sync += ["--delete"] unless is_file
+
       if answer == :upload
         with_silent_sshkit do
           spin("Uploading local -> remote...") do
             on server do
-              execute :mkdir, "-p", remote_dir
+              execute :mkdir, "-p", is_file ? File.dirname(remote_dir) : remote_dir
             end
             run_locally do
-              execute :rsync, "-rlz", "--checksum", "--delete", "#{local_dir}/", remote_spec
+              execute :rsync, *rsync_sync, local_spec, remote_spec
             end
           end
         end
@@ -446,12 +492,15 @@ agents.each do |agent|
         TTY::Pager.new(command: "less -R").page(pager_text)
         next
       end
+      rsync_sync = rsync_base + ["--checksum"]
+      rsync_sync += ["--delete"] unless is_file
+
       if answer == :download
         with_silent_sshkit do
           spin("Downloading remote -> local...") do
             run_locally do
-              execute :mkdir, "-p", local_dir
-              execute :rsync, "-rlz", "--checksum", "--delete", remote_spec, "#{local_dir}/"
+              execute :mkdir, "-p", is_file ? File.dirname(local_dir) : local_dir
+              execute :rsync, *rsync_sync, remote_spec, local_spec
             end
           end
         end

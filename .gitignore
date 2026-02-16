@@ -4,5 +4,6 @@
 # User config (use config.yml.sample as template)
 config.yml
 
-# Workspaces contain personal agent data
+# Syncable data (directories and files)
+.openclaw/
 workspaces/

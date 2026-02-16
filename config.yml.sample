@@ -4,7 +4,14 @@ remote_path: /home/debian/.openclaw
 hosts:
   - 10.0.0.1 # Replaced by ENV["HOSTS"] in .env
 
-agents:
+directories:
   - name: my-agent
-    source: workspaces/workspace-my-agent
+    source: .openclaw/workspace-my-agent
     target: workspace
+
+# Sync individual files, or use "*" to sync the whole remote_path
+# files: "*"
+# files:
+#   - name: gateway-config
+#     source: .openclaw/config.json
+#     target: config.json
