@@ -108,126 +108,159 @@ end
 
 begin
 
-sync_items.each do |agent|
-  is_file = agent["type"] == "file"
-  local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
-  remote_dir = "#{remote_path}/#{agent["target"]}"
-  remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
-  rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
-  local_spec = is_file ? local_dir : "#{local_dir}/"
+openclaw_dir = File.join(Clawkit::PROJECT_DIR, "openclaw")
 
-  # Step 1: Ensure openclaw git repo exists
-  openclaw_dir = File.join(Clawkit::PROJECT_DIR, "openclaw")
-  unless Dir.exist?(File.join(openclaw_dir, ".git"))
-    run_locally do
-      execute :git, "-C", openclaw_dir, "init"
-      execute :git, "-C", openclaw_dir, "add", "-A"
-      execute :git, "-C", openclaw_dir, "commit", "-m", "'Initial commit'", raise_on_non_zero_exit: false
-    end
-  end
-
-  # Step 2: Auto-commit any pending local changes
+# Ensure openclaw git repo exists
+unless Dir.exist?(File.join(openclaw_dir, ".git"))
   run_locally do
-    status = capture(:git, "-C", openclaw_dir, "status", "--porcelain")
-    unless status.strip.empty?
-      execute :git, "-C", openclaw_dir, "add", "-A"
-      execute :git, "-C", openclaw_dir, "commit", "-m", "'Auto-commit before sync'"
-    end
+    execute :git, "-C", openclaw_dir, "init"
+    execute :git, "-C", openclaw_dir, "add", "-A"
+    execute :git, "-C", openclaw_dir, "commit", "-m", "'Initial commit'", raise_on_non_zero_exit: false
   end
+end
 
-  # Step 3: Download from remote
-  with_silent_sshkit do
-    spin("Downloading #{agent["name"]}...") do
+# Auto-commit any pending local changes
+run_locally do
+  status = capture(:git, "-C", openclaw_dir, "status", "--porcelain")
+  unless status.strip.empty?
+    execute :git, "-C", openclaw_dir, "add", "-A"
+    execute :git, "-C", openclaw_dir, "commit", "-m", "'Auto-commit before sync'"
+  end
+end
+
+# Phase 1: Download all items
+names = sync_items.map { |a| a["name"] }.join(", ")
+with_silent_sshkit do
+  spin("Downloading #{names}...") do
+    sync_items.each do |agent|
+      is_file = agent["type"] == "file"
+      local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
+      remote_dir = "#{remote_path}/#{agent["target"]}"
+      remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
+      rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
+      local_spec = is_file ? local_dir : "#{local_dir}/"
+
       run_locally do
         execute :mkdir, "-p", is_file ? File.dirname(local_dir) : local_dir
         execute :rsync, *rsync_flags, "--checksum", remote_spec, local_spec
       end
     end
   end
+end
 
-  # Step 4: Check git status
-  git_status = run_locally do
-    capture(:git, "-C", openclaw_dir, "status", "--porcelain")
-  end
+# Phase 2: Check git status to categorize items
+git_status = run_locally do
+  capture(:git, "-C", openclaw_dir, "status", "--porcelain")
+end
 
-  # Step 5: No changes
-  if git_status.strip.empty?
-    puts PASTEL.green("[✔] #{agent["name"]} in sync.")
-    next
-  end
+if git_status.strip.empty?
+  puts PASTEL.green("[✔] #{names} in sync.")
+else
+  # Figure out which items have changes based on their source paths
+  changed_files = git_status.lines.map { |l| l.strip }.reject(&:empty?)
+  in_sync = []
+  changed = []
 
-  # Step 6: Changes detected — prompt loop
-  changed_count = git_status.lines.count { |l| !l.strip.empty? }
-  puts ""
-  puts "#{agent["name"]}: #{changed_count} file(s) changed after download."
-  puts ""
+  sync_items.each do |agent|
+    source = agent["source"]
+    # Strip the leading openclaw/ prefix to get relative path within the git repo
+    rel = source.sub(%r{\Aopenclaw/}, "")
+    is_file = agent["type"] == "file"
 
-  prompt = TTY::Prompt.new
-  loop do
-    answer = prompt.select("What would you like to do?", enum: ")") do |menu|
-      menu.choice "See changes", :see
-      menu.choice "Restart", :restart
-      menu.choice "Upload", :upload
-      menu.choice "Skip", :skip
+    has_changes = if is_file
+      changed_files.any? { |f| f.end_with?(rel) }
+    else
+      changed_files.any? { |f| f.include?(rel) }
     end
 
-    case answer
-    when :see
-      system("code", openclaw_dir)
-      next
-    when :restart
-      # Discard downloaded changes, re-download
-      run_locally do
-        execute :git, "-C", openclaw_dir, "checkout", "."
-        execute :git, "-C", openclaw_dir, "clean", "-fd"
+    if has_changes
+      changed << agent
+    else
+      in_sync << agent
+    end
+  end
+
+  if in_sync.any?
+    puts PASTEL.green("[✔] #{in_sync.map { |a| a["name"] }.join(" & ")} in sync.")
+  end
+  if changed.any?
+    changed_count = changed_files.size
+    puts PASTEL.yellow("[~] #{changed.map { |a| a["name"] }.join(" & ")} changed (#{changed_count} file(s))")
+  end
+  puts ""
+
+  # Phase 3: Prompt for changed items
+  changed.each do |agent|
+    is_file = agent["type"] == "file"
+    local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
+    remote_dir = "#{remote_path}/#{agent["target"]}"
+    remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
+    rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
+    local_spec = is_file ? local_dir : "#{local_dir}/"
+
+    prompt = TTY::Prompt.new
+    loop do
+      answer = prompt.select("#{agent["name"]}:", enum: ")") do |menu|
+        menu.choice "See changes", :see
+        menu.choice "Restart", :restart
+        menu.choice "Upload", :upload
+        menu.choice "Skip", :skip
       end
-      # Re-download
-      with_silent_sshkit do
-        spin("Re-downloading #{agent["name"]}...") do
-          run_locally do
-            execute :rsync, *rsync_flags, "--checksum", remote_spec, local_spec
+
+      case answer
+      when :see
+        system("code", openclaw_dir)
+        next
+      when :restart
+        # Discard downloaded changes, re-download
+        run_locally do
+          execute :git, "-C", openclaw_dir, "checkout", "."
+          execute :git, "-C", openclaw_dir, "clean", "-fd"
+        end
+        with_silent_sshkit do
+          spin("Re-downloading #{agent["name"]}...") do
+            run_locally do
+              execute :rsync, *rsync_flags, "--checksum", remote_spec, local_spec
+            end
           end
         end
-      end
-      # Re-check
-      git_status = run_locally { capture(:git, "-C", openclaw_dir, "status", "--porcelain") }
-      if git_status.strip.empty?
-        puts PASTEL.green("[✔] #{agent["name"]} in sync.")
+        git_status = run_locally { capture(:git, "-C", openclaw_dir, "status", "--porcelain") }
+        if git_status.strip.empty?
+          puts PASTEL.green("[✔] #{agent["name"]} in sync.")
+          break
+        end
+        file_count = git_status.lines.count { |l| !l.strip.empty? }
+        puts "#{file_count} file(s) still changed."
+        next
+      when :upload
+        run_locally do
+          execute :git, "-C", openclaw_dir, "add", "-A"
+          execute :git, "-C", openclaw_dir, "commit", "-m", "'Sync: #{agent["name"]}'"
+        end
+        with_silent_sshkit do
+          spin("Uploading #{agent["name"]}...") do
+            on server do
+              execute :mkdir, "-p", is_file ? File.dirname(remote_dir) : remote_dir
+            end
+            run_locally do
+              execute :rsync, *rsync_flags, "--checksum", local_spec, remote_spec
+            end
+          end
+        end
+        puts "  Done."
+        break
+      when :skip
+        run_locally do
+          execute :git, "-C", openclaw_dir, "checkout", "."
+          execute :git, "-C", openclaw_dir, "clean", "-fd"
+        end
+        puts "  Skipped."
         break
       end
-      changed_count = git_status.lines.count { |l| !l.strip.empty? }
-      puts "#{changed_count} file(s) still changed."
-      next
-    when :upload
-      # Commit changes, then upload to all remotes
-      run_locally do
-        execute :git, "-C", openclaw_dir, "add", "-A"
-        execute :git, "-C", openclaw_dir, "commit", "-m", "'Sync: #{agent["name"]}'"
-      end
-      with_silent_sshkit do
-        spin("Uploading #{agent["name"]}...") do
-          on server do
-            execute :mkdir, "-p", is_file ? File.dirname(remote_dir) : remote_dir
-          end
-          run_locally do
-            execute :rsync, *rsync_flags, "--checksum", local_spec, remote_spec
-          end
-        end
-      end
-      puts "  Done."
-      break
-    when :skip
-      # Discard downloaded changes
-      run_locally do
-        execute :git, "-C", openclaw_dir, "checkout", "."
-        execute :git, "-C", openclaw_dir, "clean", "-fd"
-      end
-      puts "  Skipped."
-      break
     end
-  end
 
-  puts ""
+    puts ""
+  end
 end
 
 rescue Interrupt
