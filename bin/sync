@@ -86,9 +86,10 @@ abort "Error: Nothing to sync." if sync_items.empty?
 
 # Use first host only
 host = hosts.first
+host_display = config.fetch("private_mode", false) ? "[REDACTED]" : host
 
 puts "Syncing:  #{sync_items.map { |a| a["name"] }.join(", ")}"
-puts "Host:    #{host}"
+puts "Host:     #{host_display}"
 puts ""
 
 SSHKit.config.default_env = {
@@ -190,49 +191,49 @@ else
   puts ""
 
   # Phase 3: Prompt for changed items
-  changed.each do |agent|
-    is_file = agent["type"] == "file"
-    local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
-    remote_dir = "#{remote_path}/#{agent["target"]}"
-    remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
-    rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
-    local_spec = is_file ? local_dir : "#{local_dir}/"
+  prompt = TTY::Prompt.new
+  loop do
+    answer = prompt.select("Changes detected:", enum: ")") do |menu|
+      menu.choice "See changes", :see
+      menu.choice "Restart", :restart
+      menu.choice "Upload", :upload
+      menu.choice "Skip", :skip
+    end
 
-    prompt = TTY::Prompt.new
-    loop do
-      answer = prompt.select("#{agent["name"]}:", enum: ")") do |menu|
-        menu.choice "See changes", :see
-        menu.choice "Restart", :restart
-        menu.choice "Upload", :upload
-        menu.choice "Skip", :skip
+    case answer
+    when :see
+      system("code", openclaw_dir)
+      next
+    when :restart
+      # Discard downloaded changes, re-download
+      run_locally do
+        execute :git, "-C", openclaw_dir, "checkout", "."
+        execute :git, "-C", openclaw_dir, "clean", "-fd"
       end
-
-      case answer
-      when :see
-        system("code", openclaw_dir)
-        next
-      when :restart
-        # Discard downloaded changes, re-download
-        run_locally do
-          execute :git, "-C", openclaw_dir, "checkout", "."
-          execute :git, "-C", openclaw_dir, "clean", "-fd"
-        end
-        with_silent_sshkit do
-          spin("Re-downloading #{agent["name"]}...") do
-            run_locally do
-              execute :rsync, *rsync_flags, "--checksum", remote_spec, local_spec
-            end
+      with_silent_sshkit do
+        spin("Re-downloading #{agent["name"]}...") do
+          run_locally do
+            execute :rsync, *rsync_flags, "--checksum", remote_spec, local_spec
           end
         end
-        git_status = run_locally { capture(:git, "-C", openclaw_dir, "status", "--porcelain") }
-        if git_status.strip.empty?
-          puts PASTEL.green("[✔] #{agent["name"]} in sync.")
-          break
-        end
-        file_count = git_status.lines.count { |l| !l.strip.empty? }
-        puts "#{file_count} file(s) still changed."
-        next
-      when :upload
+      end
+      git_status = run_locally { capture(:git, "-C", openclaw_dir, "status", "--porcelain") }
+      if git_status.strip.empty?
+        puts PASTEL.green("[✔] #{agent["name"]} in sync.")
+        break
+      end
+      file_count = git_status.lines.count { |l| !l.strip.empty? }
+      puts "#{file_count} file(s) still changed."
+      next
+    when :upload
+      changed.each do |agent|
+        is_file = agent["type"] == "file"
+        local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
+        remote_dir = "#{remote_path}/#{agent["target"]}"
+        remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
+        rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
+        local_spec = is_file ? local_dir : "#{local_dir}/"
+
         run_locally do
           execute :git, "-C", openclaw_dir, "add", "-A"
           execute :git, "-C", openclaw_dir, "commit", "-m", "'Sync: #{agent["name"]}'"
@@ -247,20 +248,22 @@ else
             end
           end
         end
-        puts "  Done."
-        break
-      when :skip
+      end
+      puts "  Done."
+      break
+    when :skip
+      with_silent_sshkit do
         run_locally do
           execute :git, "-C", openclaw_dir, "checkout", "."
           execute :git, "-C", openclaw_dir, "clean", "-fd"
         end
-        puts "  Skipped."
-        break
       end
+      puts "  Skipped."
+      break
     end
-
-    puts ""
   end
+
+  puts ""
 end
 
 rescue Interrupt

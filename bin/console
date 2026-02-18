@@ -12,7 +12,8 @@ ssh_user = config.fetch("ssh_user", "debian")
 hosts = Clawkit.resolve_hosts(config)
 
 host = ARGV[0] || hosts.first
+host_display = config.fetch("private_mode", false) ? "[REDACTED]" : host
 abort "Error: No host configured." unless host
 
-puts "Connecting to #{ssh_user}@#{host}..."
+puts "Connecting to #{ssh_user}@#{host_display}..."
 exec "ssh", "#{ssh_user}@#{host}"
