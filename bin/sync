@@ -63,7 +63,7 @@ end
 files_config = config.fetch("files", nil)
 if files_config == "*"
   # Wildcard: sync the whole remote_path as a directory
-  sync_items << { "name" => "remote", "source" => ".openclaw", "target" => ".", "type" => "directory" }
+  sync_items << { "name" => "remote", "source" => "openclaw", "target" => ".", "type" => "directory" }
 elsif files_config.is_a?(Array)
   files_config.each do |file|
     abort "Error: Invalid source for #{file["name"]}: #{file["source"]}" unless Clawkit.safe_path?(file["source"])
@@ -116,8 +116,8 @@ sync_items.each do |agent|
   rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
   local_spec = is_file ? local_dir : "#{local_dir}/"
 
-  # Step 1: Ensure .openclaw git repo exists
-  openclaw_dir = File.join(Clawkit::PROJECT_DIR, ".openclaw")
+  # Step 1: Ensure openclaw git repo exists
+  openclaw_dir = File.join(Clawkit::PROJECT_DIR, "openclaw")
   unless Dir.exist?(File.join(openclaw_dir, ".git"))
     run_locally do
       execute :git, "-C", openclaw_dir, "init"

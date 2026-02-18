@@ -5,8 +5,4 @@
 config.yml
 
 # Syncable data (directories and files)
-.openclaw/
-workspaces/
-# symlinked from other locations, so not ignored by default
-.openclaw
-workspaces
+openclaw/

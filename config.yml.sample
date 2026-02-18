@@ -6,12 +6,12 @@ hosts:
 
 directories:
   - name: my-agent
-    source: .openclaw/workspace-my-agent
+    source: openclaw/workspace-my-agent
     target: workspace
 
 # Sync individual files, or use "*" to sync the whole remote_path
 # files: "*"
 # files:
 #   - name: gateway-config
-#     source: .openclaw/config.json
+#     source: openclaw/config.json
 #     target: config.json

@@ -49,28 +49,28 @@ hosts:
 
 directories:
   - name: my-agent
-    source: .openclaw/workspace-my-agent
+    source: openclaw/workspace-my-agent
     target: workspace
 
 # Sync individual files:
 # files:
 #   - name: gateway-config
-#     source: .openclaw/config.json
+#     source: openclaw/config.json
 #     target: config.json
 
 # Or use wildcard to sync the whole remote_path:
 # files: "*"
 ```
 
-`directories:` entries map a local `source` directory (inside `.openclaw/`) to a `target` directory under `remote_path` on the remote host. `files:` entries sync individual files. Setting `files: "*"` syncs the entire `remote_path`.
+`directories:` entries map a local `source` directory (inside `openclaw/`) to a `target` directory under `remote_path` on the remote host. `files:` entries sync individual files. Setting `files: "*"` syncs the entire `remote_path`.
 
-4. Create your workspace directories inside `.openclaw/`:
+4. Create your workspace directories inside `openclaw/`:
 
 ```sh
-mkdir -p .openclaw/workspace-my-agent
+mkdir -p openclaw/workspace-my-agent
 ```
 
-The `.openclaw/` directory is gitignored so your personal data stays local. Place your agent files (identity, memory, skills, etc.) in each workspace directory.
+The `openclaw/` directory is gitignored from the clawkit repo and managed as its own git repo for change detection. Place your agent files (identity, memory, skills, etc.) in each workspace directory.
 
 ## Commands
 
@@ -91,10 +91,13 @@ bin/sync              # Sync all configured items
 bin/sync my-agent     # Sync a specific item by name
 ```
 
-For each item, `sync` detects which side has changes and prompts you to choose the sync direction:
-- **Local -> Remote**: Push your local changes to the remote host
-- **Remote -> Local**: Pull remote changes to your local machine
-- If both sides differ, you can choose the direction or skip
+For each item, `sync` downloads from the remote host, then uses git to detect what changed inside `openclaw/`. If changes are found, you're prompted with:
+- **See changes**: Opens `openclaw/` in VS Code to review diffs
+- **Restart**: Discards downloaded changes and re-downloads from remote
+- **Upload**: Commits the changes and pushes them back to the remote host
+- **Skip**: Discards the downloaded changes
+
+The `openclaw/` directory is automatically initialized as a git repo on first run.
 
 ### `bin/console`
 
