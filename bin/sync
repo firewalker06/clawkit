@@ -6,13 +6,8 @@ ENV["BUNDLE_GEMFILE"] ||= File.expand_path("../Gemfile", __dir__)
 require "bundler/setup"
 require "sshkit"
 require "sshkit/dsl"
-require "tmpdir"
-require "fileutils"
-require "open3"
 require "tty-spinner"
-require "tty-pager"
 require "tty-prompt"
-require "tty-table"
 require "pastel"
 require_relative "../lib/clawkit"
 
@@ -30,128 +25,6 @@ def spin(status_text)
 rescue => e
   spinner.error
   raise
-end
-
-def colorize_diff(text)
-  text.lines.map do |line|
-    line = line.chomp
-    case line
-    when /\A---/, /\A\+\+\+/ then PASTEL.bold(line)
-    when /\A@@/               then PASTEL.cyan(line)
-    when /\A\+/               then PASTEL.green(line)
-    when /\A-/                then PASTEL.red(line)
-    else                           PASTEL.dim(line)
-    end
-  end.join("\n")
-end
-
-# Parse rsync itemize lines into categorized file lists.
-# Returns { modified: [...], new: [...], deleted: [...] }
-def parse_itemize(lines)
-  result = { modified: [], new: [], deleted: [] }
-  lines.each do |line|
-    case line
-    when /\A\*deleting\s+(.+)/
-      result[:deleted] << $1.strip
-    when /\A[<>]f\+{3,}\S*\s+(.+)/
-      result[:new] << $1.strip
-    when /\A[<>]f\S*\s+(.+)/
-      result[:modified] << $1.strip
-    when /\Acd\+{3,}\S*\s+(.+)/
-      # new directory, skip
-    end
-  end
-  result
-end
-
-def binary_file?(path)
-  return false unless File.exist?(path)
-  return false if File.directory?(path)
-  # Read first 8KB and check for null bytes
-  chunk = File.binread(path, 8192)
-  chunk&.include?("\x00") || false
-end
-
-# Generate unified diff output for changed files.
-# Shows each file once with local/ and remote/ labels.
-# local_dir: path to local agent directory
-# remote_dir: path to temp directory with remote copies
-# local_files: parsed itemize from local→remote dry-run
-# remote_files: parsed itemize from remote→local dry-run
-def generate_diffs(local_dir, remote_dir, local_files, remote_files)
-  sections = []
-
-  # Modified files — deduplicate across both directions, show each file once
-  modified = (local_files[:modified] + remote_files[:modified]).uniq
-  modified.each do |file|
-    local_path = File.join(local_dir, file)
-    remote_path = File.join(remote_dir, file)
-    next if File.directory?(local_path) || File.directory?(remote_path)
-    if binary_file?(local_path) || binary_file?(remote_path)
-      sections << "Binary file differs: #{file}"
-    elsif File.exist?(remote_path) && File.exist?(local_path)
-      diff, _ = Open3.capture2("diff", "-u", "--label", "local/#{file}", local_path, "--label", "remote/#{file}", remote_path)
-      sections << diff unless diff.empty?
-    end
-  end
-
-  # New files only on local (local→remote dry-run shows them as new)
-  local_files[:new].each do |file|
-    local_path = File.join(local_dir, file)
-    next unless File.exist?(local_path)
-    next if File.directory?(local_path)
-    if binary_file?(local_path)
-      sections << "Binary file (local only): #{file}"
-    else
-      content = File.read(local_path)
-      lines = content.lines.map { |l| "+#{l.chomp}" }
-      sections << "--- /dev/null\n+++ local/#{file}\n@@ -0,0 +1,#{lines.size} @@\n#{lines.join("\n")}"
-    end
-  end
-
-  # New files only on remote (remote→local dry-run shows them as new)
-  remote_files[:new].each do |file|
-    remote_path = File.join(remote_dir, file)
-    next unless File.exist?(remote_path)
-    next if File.directory?(remote_path)
-    if binary_file?(remote_path)
-      sections << "Binary file (remote only): #{file}"
-    else
-      content = File.read(remote_path)
-      lines = content.lines.map { |l| "+#{l.chomp}" }
-      sections << "--- /dev/null\n+++ remote/#{file}\n@@ -0,0 +1,#{lines.size} @@\n#{lines.join("\n")}"
-    end
-  end
-
-  # Deleted from local (local→remote dry-run shows *deleting)
-  local_files[:deleted].each do |file|
-    remote_path = File.join(remote_dir, file)
-    next unless File.exist?(remote_path)
-    next if File.directory?(remote_path)
-    if binary_file?(remote_path)
-      sections << "Binary file (deleted from local): #{file}"
-    else
-      content = File.read(remote_path)
-      lines = content.lines.map { |l| "-#{l.chomp}" }
-      sections << "--- remote/#{file}\n+++ /dev/null\n@@ -1,#{lines.size} +0,0 @@\n#{lines.join("\n")}"
-    end
-  end
-
-  # Deleted from remote (remote→local dry-run shows *deleting)
-  remote_files[:deleted].each do |file|
-    local_path = File.join(local_dir, file)
-    next unless File.exist?(local_path)
-    next if File.directory?(local_path)
-    if binary_file?(local_path)
-      sections << "Binary file (deleted from remote): #{file}"
-    else
-      content = File.read(local_path)
-      lines = content.lines.map { |l| "-#{l.chomp}" }
-      sections << "--- local/#{file}\n+++ /dev/null\n@@ -1,#{lines.size} +0,0 @@\n#{lines.join("\n")}"
-    end
-  end
-
-  sections.join("\n")
 end
 
 # Silence SSHKit logger during spinner phases to prevent log lines from breaking the output.
@@ -240,274 +113,116 @@ sync_items.each do |agent|
   local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
   remote_dir = "#{remote_path}/#{agent["target"]}"
   remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
-
-  # Dry-run rsync in both directions to figure out which side has actual content changes.
-  #
-  # We use --checksum so rsync compares files by content hash instead of modification time.
-  # Without it, rsync defaults to comparing mtimes, and since local and remote machines almost
-  # always have different timestamps for the same files (e.g. after a fresh clone or copy),
-  # every file would show up as "changed" even when the content is identical.
-  #
-  # We also use -rlz instead of -a (archive mode). The -a flag includes -rlptgoD, which
-  # preserves permissions, owner, and group. Since local (macOS) and remote (Linux) have
-  # different users/UIDs, those metadata differences would also trigger false positives.
-  # We only need: -r (recursive), -l (symlinks), -z (compress during transfer).
-  #
-  # --itemize-changes makes rsync output one line per file describing what differs.
-  # Each line looks like: "<f.sT....." where each character position means something:
-  #   Position 0: < (sent), > (received), c (created), . (not transferred)
-  #   Position 1: f (file), d (directory)
-  #   Position 2: c (checksum differs), . (same)
-  #   Position 3: s (size differs), . (same)
-  #   Position 4: T (timestamp differs), . (same)
-  #   ...etc for permissions, owner, group
-  #
-  # Even with --checksum, rsync still reports timestamp-only differences in the output.
-  # A line like ".f..T....." means "file exists on both sides, content is identical,
-  # only the timestamp differs" — not a real change. We filter these out so only
-  # lines with actual content/size/deletion differences are counted.
-
-  # Filter that ignores timestamp-only differences (no actual content change).
-  # Matches lines like ".f..T....." or ".d..T....." where only the T flag is set.
-  timestamp_only = /\A\.[fd]\.\.T\.+\s/
-
-  tmpdir = Dir.mktmpdir("clawkit-sync-")
-
-  # Build rsync flags based on type
-  rsync_base = is_file ? ["-lz"] : ["-rlz"]
-  rsync_dry = rsync_base + ["--checksum", "--dry-run", "--itemize-changes"]
-  rsync_dry += ["--delete"] unless is_file
+  rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
   local_spec = is_file ? local_dir : "#{local_dir}/"
 
-  result = with_silent_sshkit do
-    spin("Checking #{agent["name"]} for changes...") do
-      lc = []
-      rc = []
-      lm = nil
-      rm = nil
-
-      run_locally do
-        # Check what local -> remote would transfer (i.e. what local has that remote doesn't)
-        local_exists = is_file ? File.exist?(local_dir) : Dir.exist?(local_dir)
-        if local_exists
-          out = capture(:rsync, *rsync_dry, local_spec, remote_spec, raise_on_non_zero_exit: false)
-          lc = out.lines.map(&:strip).reject { |l| l.empty? || l.match?(timestamp_only) }
-
-          # Find latest local mtime
-          if is_file
-            lm = File.mtime(local_dir) if File.exist?(local_dir)
-          else
-            local_files = Dir.glob("#{local_dir}/**/*").select { |f| File.file?(f) }
-            lm = local_files.map { |f| File.mtime(f) }.max
-          end
-        end
-
-        # Check what remote -> local would transfer (i.e. what remote has that local doesn't)
-        out = capture(:rsync, *rsync_dry, remote_spec, local_spec, raise_on_non_zero_exit: false)
-        rc = out.lines.map(&:strip).reject { |l| l.empty? || l.match?(timestamp_only) }
-      end
-
-      # Find latest remote mtime
-      on server do
-        if is_file
-          out = capture(:stat, "-c", "%Y", remote_dir, raise_on_non_zero_exit: false)
-          ts = out.strip.to_f
-          rm = Time.at(ts) if ts > 0
-        else
-          out = capture(:find, remote_dir, "-type", "f", "-printf", "%T@\\n", raise_on_non_zero_exit: false)
-          timestamps = out.lines.map(&:strip).reject(&:empty?).map(&:to_f)
-          rm = Time.at(timestamps.max) if timestamps.any?
-        end
-      end
-
-      # Parse changed filenames and fetch remote copies for diffing
-      local_parsed = parse_itemize(lc)
-      remote_parsed = parse_itemize(rc)
-      all_remote_files = (local_parsed[:modified] + local_parsed[:deleted] +
-                          remote_parsed[:modified] + remote_parsed[:new]).uniq
-
-      diff_output = ""
-      if all_remote_files.any?
-        if is_file
-          # For single file, fetch the remote copy directly
-          run_locally do
-            execute :rsync, *rsync_base, "--checksum", remote_spec, "#{tmpdir}/", raise_on_non_zero_exit: false
-          end
-        else
-          # Write file list and fetch remote copies in one rsync call
-          files_list = File.join(tmpdir, ".files-from")
-          File.write(files_list, all_remote_files.join("\n") + "\n")
-
-          run_locally do
-            execute :rsync, "-rlz", "--checksum", "--files-from", files_list,
-              remote_spec, "#{tmpdir}/", raise_on_non_zero_exit: false
-          end
-        end
-
-        diff_output = generate_diffs(local_dir, tmpdir, local_parsed, remote_parsed)
-      else
-        diff_output = generate_diffs(local_dir, tmpdir, local_parsed, remote_parsed)
-      end
-
-      { local_changes: lc, remote_changes: rc, local_mtime: lm, remote_mtime: rm, diff_output: diff_output }
+  # Step 1: Ensure .openclaw git repo exists
+  openclaw_dir = File.join(Clawkit::PROJECT_DIR, ".openclaw")
+  unless Dir.exist?(File.join(openclaw_dir, ".git"))
+    run_locally do
+      execute :git, "-C", openclaw_dir, "init"
+      execute :git, "-C", openclaw_dir, "add", "-A"
+      execute :git, "-C", openclaw_dir, "commit", "-m", "'Initial commit'", raise_on_non_zero_exit: false
     end
   end
 
-  local_changes = result[:local_changes]
-  remote_changes = result[:remote_changes]
-  local_mtime = result[:local_mtime]
-  remote_mtime = result[:remote_mtime]
-  diff_output = result[:diff_output]
+  # Step 2: Auto-commit any pending local changes
+  run_locally do
+    status = capture(:git, "-C", openclaw_dir, "status", "--porcelain")
+    unless status.strip.empty?
+      execute :git, "-C", openclaw_dir, "add", "-A"
+      execute :git, "-C", openclaw_dir, "commit", "-m", "'Auto-commit before sync'"
+    end
+  end
 
-  has_local_changes = local_changes.any?
-  has_remote_changes = remote_changes.any?
+  # Step 3: Download from remote
+  with_silent_sshkit do
+    spin("Downloading #{agent["name"]}...") do
+      run_locally do
+        execute :mkdir, "-p", is_file ? File.dirname(local_dir) : local_dir
+        execute :rsync, *rsync_flags, "--checksum", remote_spec, local_spec
+      end
+    end
+  end
 
-  if !has_local_changes && !has_remote_changes
-    puts PASTEL.green("[✔] Skipping: #{agent["name"]} in sync.")
-    FileUtils.rm_rf(tmpdir)
+  # Step 4: Check git status
+  git_status = run_locally do
+    capture(:git, "-C", openclaw_dir, "status", "--porcelain")
+  end
+
+  # Step 5: No changes
+  if git_status.strip.empty?
+    puts PASTEL.green("[✔] #{agent["name"]} in sync.")
     next
   end
 
-  local_label = local_mtime ? local_mtime.strftime("%Y-%m-%d %H:%M:%S") : "n/a"
-  remote_label = remote_mtime ? remote_mtime.strftime("%Y-%m-%d %H:%M:%S") : "n/a"
-  if local_mtime && remote_mtime
-    if local_mtime > remote_mtime
-      local_label = PASTEL.green(local_label)
-    elsif remote_mtime > local_mtime
-      remote_label = PASTEL.green(remote_label)
-    end
-  end
-
-  table = TTY::Table.new(
-    header: [agent["name"], "Local", "Remote"],
-    rows: [
-      ["Latest", local_label, remote_label],
-      ["Changes", "#{local_changes.size} file(s)", "#{remote_changes.size} file(s)"]
-    ]
-  )
+  # Step 6: Changes detected — prompt loop
+  changed_count = git_status.lines.count { |l| !l.strip.empty? }
   puts ""
-  puts table.render(:unicode, padding: [0, 1])
+  puts "#{agent["name"]}: #{changed_count} file(s) changed after download."
   puts ""
-
-  status = if has_local_changes && has_remote_changes
-    "Both sides differ"
-  elsif has_local_changes
-    "Local has changes"
-  else
-    "Remote has changes"
-  end
-
-  pager_text = if diff_output.empty?
-    local_changes.concat(remote_changes).join("\n")
-  else
-    colorize_diff(diff_output)
-  end
-
-  FileUtils.rm_rf(tmpdir)
 
   prompt = TTY::Prompt.new
-
-  if has_local_changes && has_remote_changes
-    loop do
-      answer = prompt.select("#{status}.\nSync direction?", enum: ")") do |menu|
-        menu.choice "Upload local -> remote", :upload
-        menu.choice "Download remote -> local", :download
-        menu.choice "Compare (view diff)", :compare
-        menu.choice "Skip", :skip
-      end
-      if answer == :compare
-        TTY::Pager.new(command: "less -R").page(pager_text)
-        next
-      end
-      rsync_sync = rsync_base + ["--checksum"]
-      rsync_sync += ["--delete"] unless is_file
-
-      case answer
-      when :upload
-        with_silent_sshkit do
-          spin("Uploading local -> remote...") do
-            on server do
-              execute :mkdir, "-p", is_file ? File.dirname(remote_dir) : remote_dir
-            end
-            run_locally do
-              execute :rsync, *rsync_sync, local_spec, remote_spec
-            end
-          end
-        end
-        puts "  Done."
-      when :download
-        with_silent_sshkit do
-          spin("Downloading remote -> local...") do
-            run_locally do
-              execute :mkdir, "-p", is_file ? File.dirname(local_dir) : local_dir
-              execute :rsync, *rsync_sync, remote_spec, local_spec
-            end
-          end
-        end
-        puts "  Done."
-      else
-        puts "  Skipped."
-      end
-      break
+  loop do
+    answer = prompt.select("What would you like to do?", enum: ")") do |menu|
+      menu.choice "See changes", :see
+      menu.choice "Restart", :restart
+      menu.choice "Upload", :upload
+      menu.choice "Skip", :skip
     end
-  elsif has_local_changes
-    loop do
-      answer = prompt.select("#{status}. Upload local -> remote?", enum: ")") do |menu|
-        menu.choice "Upload", :upload
-        menu.choice "Compare (view diff)", :compare
-        menu.choice "Skip", :skip
-      end
-      if answer == :compare
-        TTY::Pager.new(command: "less -R").page(pager_text)
-        next
-      end
-      rsync_sync = rsync_base + ["--checksum"]
-      rsync_sync += ["--delete"] unless is_file
 
-      if answer == :upload
-        with_silent_sshkit do
-          spin("Uploading local -> remote...") do
-            on server do
-              execute :mkdir, "-p", is_file ? File.dirname(remote_dir) : remote_dir
-            end
-            run_locally do
-              execute :rsync, *rsync_sync, local_spec, remote_spec
-            end
+    case answer
+    when :see
+      system("code", openclaw_dir)
+      next
+    when :restart
+      # Discard downloaded changes, re-download
+      run_locally do
+        execute :git, "-C", openclaw_dir, "checkout", "."
+        execute :git, "-C", openclaw_dir, "clean", "-fd"
+      end
+      # Re-download
+      with_silent_sshkit do
+        spin("Re-downloading #{agent["name"]}...") do
+          run_locally do
+            execute :rsync, *rsync_flags, "--checksum", remote_spec, local_spec
           end
         end
-        puts "  Done."
-      else
-        puts "  Skipped."
       end
+      # Re-check
+      git_status = run_locally { capture(:git, "-C", openclaw_dir, "status", "--porcelain") }
+      if git_status.strip.empty?
+        puts PASTEL.green("[✔] #{agent["name"]} in sync.")
+        break
+      end
+      changed_count = git_status.lines.count { |l| !l.strip.empty? }
+      puts "#{changed_count} file(s) still changed."
+      next
+    when :upload
+      # Commit changes, then upload to all remotes
+      run_locally do
+        execute :git, "-C", openclaw_dir, "add", "-A"
+        execute :git, "-C", openclaw_dir, "commit", "-m", "'Sync: #{agent["name"]}'"
+      end
+      with_silent_sshkit do
+        spin("Uploading #{agent["name"]}...") do
+          on server do
+            execute :mkdir, "-p", is_file ? File.dirname(remote_dir) : remote_dir
+          end
+          run_locally do
+            execute :rsync, *rsync_flags, "--checksum", local_spec, remote_spec
+          end
+        end
+      end
+      puts "  Done."
       break
-    end
-  else
-    loop do
-      answer = prompt.select("#{status}. Download remote -> local?", enum: ")") do |menu|
-        menu.choice "Download", :download
-        menu.choice "Compare (view diff)", :compare
-        menu.choice "Skip", :skip
+    when :skip
+      # Discard downloaded changes
+      run_locally do
+        execute :git, "-C", openclaw_dir, "checkout", "."
+        execute :git, "-C", openclaw_dir, "clean", "-fd"
       end
-      if answer == :compare
-        TTY::Pager.new(command: "less -R").page(pager_text)
-        next
-      end
-      rsync_sync = rsync_base + ["--checksum"]
-      rsync_sync += ["--delete"] unless is_file
-
-      if answer == :download
-        with_silent_sshkit do
-          spin("Downloading remote -> local...") do
-            run_locally do
-              execute :mkdir, "-p", is_file ? File.dirname(local_dir) : local_dir
-              execute :rsync, *rsync_sync, remote_spec, local_spec
-            end
-          end
-        end
-        puts "  Done."
-      else
-        puts "  Skipped."
-      end
+      puts "  Skipped."
       break
     end
   end
