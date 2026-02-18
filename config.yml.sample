@@ -1,6 +1,7 @@
 ssh_user: debian
 remote_path: /home/debian/.openclaw
 private_mode: false # Do not display IP addresses
+silent_mode: true   # Silence SSHKit output; set to false for debugging
 
 hosts:
   - 10.0.0.1 # Replaced by ENV["HOSTS"] in .env

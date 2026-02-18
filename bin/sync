@@ -27,24 +27,15 @@ rescue => e
   raise
 end
 
-# Silence SSHKit logger during spinner phases to prevent log lines from breaking the output.
-class NullOutput
-  def <<(_); end
-  def log_command_start(_); end
-  def log_command_data(*, **); end
-  def log_command_exit(_); end
-end
-
-def with_silent_sshkit
-  old_output = SSHKit.config.output
-  SSHKit.config.output = NullOutput.new
-  yield
-ensure
-  SSHKit.config.output = old_output
-end
-
 Clawkit.load_env
 config = Clawkit.load_config
+
+# Silence SSHKit logger to make checklist looks nice.
+# Set silent_mode: false in config.yml to see SSHKit output for debugging.
+if config.fetch("silent_mode", true)
+  SSHKit.config.output = Class.new { def <<(_); end; def log_command_start(_); end; def log_command_data(*, **); end; def log_command_exit(_); end }.new
+end
+
 ssh_user = config.fetch("ssh_user", "debian")
 remote_path = config.fetch("remote_path")
 
@@ -99,11 +90,9 @@ SSHKit.config.default_env = {
 server = SSHKit::Host.new("#{ssh_user}@#{host}")
 
 # Stop gateway before syncing
-with_silent_sshkit do
-  spin("Stopping openclaw gateway...") do
-    on server do
-      execute :openclaw, "gateway", "stop"
-    end
+spin("Stopping openclaw gateway...") do
+  on server do
+    execute :openclaw, "gateway", "stop"
   end
 end
 
@@ -131,20 +120,18 @@ end
 
 # Phase 1: Download all items
 names = sync_items.map { |a| a["name"] }.join(", ")
-with_silent_sshkit do
-  spin("Downloading #{names}...") do
-    sync_items.each do |agent|
-      is_file = agent["type"] == "file"
-      local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
-      remote_dir = "#{remote_path}/#{agent["target"]}"
-      remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
-      rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
-      local_spec = is_file ? local_dir : "#{local_dir}/"
+spin("Downloading #{names}...") do
+  sync_items.each do |agent|
+    is_file = agent["type"] == "file"
+    local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
+    remote_dir = "#{remote_path}/#{agent["target"]}"
+    remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
+    rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
+    local_spec = is_file ? local_dir : "#{local_dir}/"
 
-      run_locally do
-        execute :mkdir, "-p", is_file ? File.dirname(local_dir) : local_dir
-        execute :rsync, *rsync_flags, "--checksum", remote_spec, local_spec
-      end
+    run_locally do
+      execute :mkdir, "-p", is_file ? File.dirname(local_dir) : local_dir
+      execute :rsync, *rsync_flags, "--checksum", remote_spec, local_spec
     end
   end
 end
@@ -210,11 +197,9 @@ else
         execute :git, "-C", openclaw_dir, "checkout", "."
         execute :git, "-C", openclaw_dir, "clean", "-fd"
       end
-      with_silent_sshkit do
-        spin("Re-downloading #{agent["name"]}...") do
-          run_locally do
-            execute :rsync, *rsync_flags, "--checksum", remote_spec, local_spec
-          end
+      spin("Re-downloading #{agent["name"]}...") do
+        run_locally do
+          execute :rsync, *rsync_flags, "--checksum", remote_spec, local_spec
         end
       end
       git_status = run_locally { capture(:git, "-C", openclaw_dir, "status", "--porcelain") }
@@ -238,25 +223,21 @@ else
           execute :git, "-C", openclaw_dir, "add", "-A"
           execute :git, "-C", openclaw_dir, "commit", "-m", "'Sync: #{agent["name"]}'"
         end
-        with_silent_sshkit do
-          spin("Uploading #{agent["name"]}...") do
-            on server do
-              execute :mkdir, "-p", is_file ? File.dirname(remote_dir) : remote_dir
-            end
-            run_locally do
-              execute :rsync, *rsync_flags, "--checksum", local_spec, remote_spec
-            end
+        spin("Uploading #{agent["name"]}...") do
+          on server do
+            execute :mkdir, "-p", is_file ? File.dirname(remote_dir) : remote_dir
+          end
+          run_locally do
+            execute :rsync, *rsync_flags, "--checksum", local_spec, remote_spec
           end
         end
       end
       puts "  Done."
       break
     when :skip
-      with_silent_sshkit do
-        run_locally do
-          execute :git, "-C", openclaw_dir, "checkout", "."
-          execute :git, "-C", openclaw_dir, "clean", "-fd"
-        end
+      run_locally do
+        execute :git, "-C", openclaw_dir, "checkout", "."
+        execute :git, "-C", openclaw_dir, "clean", "-fd"
       end
       puts "  Skipped."
       break
@@ -270,11 +251,9 @@ rescue Interrupt
   puts "\n  Aborted."
 ensure
   # Always restart the gateway, even if interrupted
-  with_silent_sshkit do
-    spin("Starting openclaw gateway...") do
-      on server do
-        execute :openclaw, "gateway", "start"
-      end
+  spin("Starting openclaw gateway...") do
+    on server do
+      execute :openclaw, "gateway", "start"
     end
   end
 end
