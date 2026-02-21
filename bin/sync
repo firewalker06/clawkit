@@ -219,9 +219,13 @@ else
         rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
         local_spec = is_file ? local_dir : "#{local_dir}/"
 
-        run_locally do
-          execute :git, "-C", openclaw_dir, "add", "-A"
-          execute :git, "-C", openclaw_dir, "commit", "-m", "'Sync: #{agent["name"]}'"
+        git_status = run_locally { capture(:git, "-C", openclaw_dir, "status", "--porcelain") }
+
+        unless git_status.strip.empty?
+          run_locally do
+            execute :git, "-C", openclaw_dir, "add", "-A"
+            execute :git, "-C", openclaw_dir, "commit", "-m", "'Sync: #{agent["name"]}'"
+          end
         end
         spin("Uploading #{agent["name"]}...") do
           on server do
