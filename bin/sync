@@ -211,23 +211,23 @@ else
       puts "#{file_count} file(s) still changed."
       next
     when :upload
-      changed.each do |agent|
-        is_file = agent["type"] == "file"
-        local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
-        remote_dir = "#{remote_path}/#{agent["target"]}"
-        remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
-        rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
-        local_spec = is_file ? local_dir : "#{local_dir}/"
-
-        git_status = run_locally { capture(:git, "-C", openclaw_dir, "status", "--porcelain") }
-
-        unless git_status.strip.empty?
-          run_locally do
-            execute :git, "-C", openclaw_dir, "add", "-A"
-            execute :git, "-C", openclaw_dir, "commit", "-m", "'Sync: #{agent["name"]}'"
-          end
+      git_status = run_locally { capture(:git, "-C", openclaw_dir, "status", "--porcelain") }
+      unless git_status.strip.empty?
+        run_locally do
+          execute :git, "-C", openclaw_dir, "add", "-A"
+          execute :git, "-C", openclaw_dir, "commit", "-m", "'Sync before upload'"
         end
-        spin("Uploading #{agent["name"]}...") do
+      end
+
+      spin("Uploading #{names}...") do
+        sync_items.each do |agent|
+          is_file = agent["type"] == "file"
+          local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
+          remote_dir = "#{remote_path}/#{agent["target"]}"
+          remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
+          rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
+          local_spec = is_file ? local_dir : "#{local_dir}/"
+
           on server do
             execute :mkdir, "-p", is_file ? File.dirname(remote_dir) : remote_dir
           end
