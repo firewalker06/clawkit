@@ -114,7 +114,7 @@ run_locally do
   status = capture(:git, "-C", openclaw_dir, "status", "--porcelain")
   unless status.strip.empty?
     execute :git, "-C", openclaw_dir, "add", "-A"
-    execute :git, "-C", openclaw_dir, "commit", "-m", "'Auto-commit before sync'"
+    execute :git, "-C", openclaw_dir, "commit", "-m", "'Auto-commit before sync'", raise_on_non_zero_exit: false
   end
 end
 
