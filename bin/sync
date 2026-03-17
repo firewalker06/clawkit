@@ -65,6 +65,8 @@ end
 
 hosts = Clawkit.resolve_hosts(config)
 
+just_upload = ARGV.delete("--just-upload")
+
 # Filter items if names given as arguments
 if ARGV.any?
   selected = sync_items.select { |a| ARGV.include?(a["name"]) }
@@ -118,8 +120,30 @@ run_locally do
   end
 end
 
-# Phase 1: Download all items
 names = sync_items.map { |a| a["name"] }.join(", ")
+
+if just_upload
+  spin("Uploading #{names}...") do
+    sync_items.each do |agent|
+      is_file = agent["type"] == "file"
+      local_dir = File.join(Clawkit::PROJECT_DIR, agent["source"])
+      remote_dir = "#{remote_path}/#{agent["target"]}"
+      remote_spec = "#{ssh_user}@#{host}:#{remote_dir}#{is_file ? "" : "/"}"
+      rsync_flags = is_file ? ["-lz"] : ["-rlz", "--delete"]
+      local_spec = is_file ? local_dir : "#{local_dir}/"
+
+      on server do
+        execute :mkdir, "-p", is_file ? File.dirname(remote_dir) : remote_dir
+      end
+      run_locally do
+        execute :rsync, *rsync_flags, "--checksum", local_spec, remote_spec
+      end
+    end
+  end
+  puts "  Done."
+else
+
+# Phase 1: Download all items
 spin("Downloading #{names}...") do
   sync_items.each do |agent|
     is_file = agent["type"] == "file"
@@ -250,6 +274,8 @@ else
 
   puts ""
 end
+
+end # just_upload else
 
 rescue Interrupt
   puts "\n  Aborted."
